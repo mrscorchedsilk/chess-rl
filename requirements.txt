@@ -1,0 +1,5 @@
+# PyTorch is pre-installed in this environment (torch 2.12.0+cu130); the project
+# venv bridges it via a .pth file. In a fresh environment, install the CUDA wheel
+# first:  pip install torch --index-url https://download.pytorch.org/whl/cu130
+python-chess>=1.10
+numpy

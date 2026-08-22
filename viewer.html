@@ -1,0 +1,336 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ChessNet — Self-Play (AlphaZero-style)</title>
+<style>
+  :root{
+    --bg:#0f141a; --panel:#161d26; --border:#2a3542;
+    --text:#e8ecf1; --muted:#8fa0b0; --accent:#4f8cff;
+    --light:#eeeed2; --dark:#769656;
+    --hl:#f6f669; --check:#e04545;
+  }
+  *{box-sizing:border-box; margin:0; padding:0;}
+  html,body{height:100%;}
+  body{
+    background:radial-gradient(1100px 600px at 50% -10%, #1a2430, var(--bg) 65%);
+    color:var(--text);
+    font-family:'Segoe UI', system-ui, -apple-system, sans-serif;
+    display:flex; justify-content:center; align-items:flex-start;
+    min-height:100vh; padding:24px 16px;
+    -webkit-font-smoothing:antialiased;
+  }
+  .app{ width:min(1020px,100%); }
+
+  header{ display:flex; align-items:baseline; gap:12px; flex-wrap:wrap; margin-bottom:14px; }
+  header h1{ font-size:20px; font-weight:650; letter-spacing:.2px; }
+  header h1 .net{ color:var(--accent); }
+  #status{ color:var(--muted); font-size:14px; }
+  #status .live{ color:#53c47b; }
+  #status.win{ color:#ffb4a1; font-weight:600; }
+
+  .main{ display:flex; gap:22px; align-items:flex-start; flex-wrap:wrap; }
+
+  /* ---- board + eval bar ---- */
+  .board-row{ display:flex; gap:12px; align-items:stretch; }
+  .evalbar{
+    width:14px; border-radius:6px; overflow:hidden; background:#3a3535;
+    display:flex; flex-direction:column; position:relative; border:1px solid var(--border);
+  }
+  .evalbar .wfill{ background:#f6f6f6; width:100%; transition:height .5s ease; }
+  .evalbar .mid{ position:absolute; left:0; right:0; top:50%; height:1px; background:#00000055; }
+  .board-wrap{ position:relative; }
+  .board{
+    display:grid; grid-template-columns:repeat(8,1fr);
+    width:min(74vh, 620px, 72vw);
+    aspect-ratio:1; border-radius:8px; overflow:hidden;
+    box-shadow:0 24px 60px rgba(0,0,0,.55), 0 0 0 1px var(--border);
+  }
+  .sq{ position:relative; display:flex; align-items:center; justify-content:center; }
+  .sq.light{ background:var(--light); }
+  .sq.dark{ background:var(--dark); }
+  .coord{ position:absolute; font-size:11px; font-weight:700; pointer-events:none; }
+  .sq.light .coord{ color:var(--dark); }
+  .sq.dark .coord{ color:var(--light); }
+  .coord.rank{ top:2px; left:3px; }
+  .coord.file{ bottom:1px; right:3px; }
+  .sq::before{ content:''; position:absolute; inset:0; pointer-events:none; }
+  .sq.from::before{ background:rgba(246,246,105,.45); }
+  .sq.to::before{ background:rgba(246,246,105,.32); }
+  .sq.check::before{ background:radial-gradient(circle, rgba(224,69,69,.72) 30%, transparent 72%); }
+  .piece{
+    font-family:'Segoe UI Symbol','Noto Sans Symbols 2','DejaVu Sans','Apple Symbols',system-ui,sans-serif;
+    line-height:1; position:relative; z-index:1; pointer-events:none;
+    animation:drop .22s ease;
+  }
+  @keyframes drop{ from{ transform:translateY(-8%); opacity:0; } to{ transform:none; opacity:1; } }
+  .piece.w{ color:#ffffff; text-shadow:-1px -1px 0 #39424c, 1px -1px 0 #39424c, -1px 1px 0 #39424c, 1px 1px 0 #39424c, 0 -1px 0 #39424c, 0 1px 0 #39424c, -1px 0 0 #39424c, 1px 0 0 #39424c; }
+  .piece.b{ color:#151a20; text-shadow:-1px -1px 0 rgba(255,255,255,.6), 1px -1px 0 rgba(255,255,255,.6), -1px 1px 0 rgba(255,255,255,.6), 1px 1px 0 rgba(255,255,255,.6), 0 -1px 0 rgba(255,255,255,.6), 0 1px 0 rgba(255,255,255,.6), -1px 0 0 rgba(255,255,255,.6), 1px 0 0 rgba(255,255,255,.6); }
+
+  /* ---- side panel ---- */
+  .side{ display:flex; flex-direction:column; gap:12px; width:min(320px,100%); }
+  .card{ background:var(--panel); border:1px solid var(--border); border-radius:10px; padding:12px 14px; }
+  .card h2{ font-size:12px; text-transform:uppercase; letter-spacing:.08em; color:var(--muted); margin-bottom:9px; font-weight:600; }
+
+  .controls{ display:flex; gap:8px; flex-wrap:wrap; }
+  .btn{
+    background:#1d2834; color:var(--text); border:1px solid var(--border); border-radius:8px;
+    padding:8px 13px; font-size:13px; cursor:pointer; transition:.12s;
+  }
+  .btn:hover{ border-color:#4a5d70; background:#243340; }
+  .btn:disabled{ opacity:.45; cursor:default; }
+  select{
+    background:#1d2834; color:var(--text); border:1px solid var(--border);
+    border-radius:8px; padding:8px 10px; font-size:13px; cursor:pointer; outline:none;
+  }
+
+  .status-line{ display:flex; align-items:center; gap:9px; font-size:13.5px; }
+  .dot{ width:9px; height:9px; border-radius:50%; background:#53c47b; flex:none; }
+  .dot.think{ background:#f6b73c; animation:pulse 1s infinite; }
+  @keyframes pulse{ 0%,100%{ opacity:1; } 50%{ opacity:.25; } }
+
+  .moves{
+    max-height:250px; overflow-y:auto; font-size:13.5px; line-height:2;
+    display:grid; grid-template-columns:auto 1fr 1fr; column-gap:8px;
+  }
+  .moves .num{ color:var(--muted); text-align:right; }
+  .moves .m{ font-variant-numeric:tabular-nums; }
+  .moves .m.last{ color:var(--accent); font-weight:600; }
+
+  .topmove{ display:flex; justify-content:space-between; align-items:center; font-size:13.5px; padding:4px 0; border-bottom:1px solid #ffffff08; }
+  .topmove:last-child{ border-bottom:none; }
+  .topmove .san{ font-weight:600; }
+  .topmove .bar{ flex:1; height:6px; background:#ffffff14; border-radius:3px; margin:0 10px; overflow:hidden; }
+  .topmove .bar i{ display:block; height:100%; background:var(--accent); }
+  .topmove .v{ color:var(--muted); font-variant-numeric:tabular-nums; min-width:52px; text-align:right; }
+
+  .meta{ font-size:12px; color:var(--muted); line-height:1.7; }
+  .meta b{ color:var(--text); }
+  .hint{ font-size:11.5px; color:var(--muted); line-height:1.5; }
+
+  @media (max-width:680px){
+    .board{ width:min(92vw,74vh); }
+    .side{ width:100%; }
+  }
+</style>
+</head>
+<body>
+<div class="app">
+  <header>
+    <h1>♞ <span class="net">ChessNet</span> — self-play</h1>
+    <div id="status">connecting…</div>
+  </header>
+
+  <div class="main">
+    <div class="board-row">
+      <div class="evalbar" id="evalbar"><div class="wfill" id="wfill" style="height:50%"></div><div class="mid"></div></div>
+      <div class="board" id="board"></div>
+    </div>
+
+    <aside class="side">
+      <div class="card">
+        <h2>Control</h2>
+        <div class="controls">
+          <button class="btn" id="btnNew">New game</button>
+          <button class="btn" id="btnPause">Pause</button>
+          <label>Sims
+            <select id="sims">
+              <option value="25">25</option>
+              <option value="50">50</option>
+              <option value="100" selected>100</option>
+              <option value="200">200</option>
+              <option value="400">400</option>
+            </select>
+          </label>
+        </div>
+        <div class="status-line" style="margin-top:11px">
+          <span class="dot" id="dot"></span>
+          <span id="statustext">starting…</span>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>What the net is thinking</h2>
+        <div id="topmoves"><div class="meta">waiting for the first search…</div></div>
+      </div>
+
+      <div class="card">
+        <h2>Moves</h2>
+        <div class="moves" id="moves"></div>
+      </div>
+
+      <div class="card">
+        <h2>Model</h2>
+        <div class="meta" id="meta">—</div>
+        <div class="hint" style="margin-top:8px">
+          Both sides are the same neural net (ResNet policy + value) choosing moves
+          through Monte-Carlo Tree Search — the AlphaZero self-play loop, live.
+        </div>
+      </div>
+    </aside>
+  </div>
+</div>
+
+<script>
+const GLYPH = { K:'♚', Q:'♛', R:'♜', B:'♝', N:'♞', P:'♟', k:'♚', q:'♛', r:'♜', b:'♝', n:'♞', p:'♟' };
+const $ = id => document.getElementById(id);
+
+let lastPly = -1;
+
+function fenToBoard(fen){
+  const rows = fen.split(' ')[0].split('/');
+  const board = new Array(64).fill(null);
+  for (let r=0;r<8;r++){
+    const rank = 8 - r; let f = 0;
+    for (const ch of rows[r]){
+      if (ch>='0' && ch<='9'){ f += +ch; continue; }
+      board[(rank-1)*8 + f] = ch; f++;
+    }
+  }
+  return board;
+}
+
+function renderBoard(fen, lastMove, checkSquare){
+  const board = fenToBoard(fen);
+  const b = $('board');
+  b.innerHTML = '';
+  const sq = b.clientWidth / 8;
+  b.style.fontSize = (sq * 0.78) + 'px';
+
+  // coordinates: rank 8 at top, rank 1 at bottom
+  for (let row=0; row<8; row++){
+    const rank = 8 - row;
+    for (let file=0; file<8; file++){
+      const idx = (rank-1)*8 + file;
+      const div = document.createElement('div');
+      div.className = 'sq ' + (((rank+file)&1)===0 ? 'dark' : 'light');
+      const sqName = 'abcdefgh'[file] + rank;
+      if (lastMove){
+        if (sqName === lastMove.from) div.classList.add('from');
+        if (sqName === lastMove.to) div.classList.add('to');
+      }
+      if (checkSquare && sqName === checkSquare) div.classList.add('check');
+      const p = board[idx];
+      if (p){
+        const span = document.createElement('span');
+        span.className = 'piece ' + (p === p.toUpperCase() ? 'w' : 'b');
+        span.textContent = GLYPH[p];
+        div.appendChild(span);
+      }
+      if (file === 0){
+        const c = document.createElement('span'); c.className='coord rank'; c.textContent=rank;
+        div.appendChild(c);
+      }
+      if (row === 7){
+        const c = document.createElement('span'); c.className='coord file'; c.textContent='abcdefgh'[file];
+        div.appendChild(c);
+      }
+      b.appendChild(div);
+    }
+  }
+}
+
+function findCheckSquare(fen){
+  // king square of the side to move, if in check (server sends it via top-level state? no)
+  // We derive from FEN only lightly: highlight not attempted here without a check flag.
+  return null;
+}
+
+function renderMoves(moves, ply){
+  const el = $('moves'); el.innerHTML = '';
+  let html = '';
+  for (let i=0;i<moves.length;i++){
+    const n = (i>>1)+1;
+    if (i%2===0) html += `<span class="num">${n}.</span>`;
+    else html += `<span class="num"></span>`;
+    const cls = (i === ply-1) ? 'm last' : 'm';
+    html += `<span class="${cls}">${moves[i]}</span>`;
+  }
+  el.innerHTML = html;
+  el.scrollTop = el.scrollHeight;
+}
+
+function renderTopMoves(tm){
+  const el = $('topmoves');
+  if (!tm || !tm.length){ el.innerHTML = '<div class="meta">no data yet…</div>'; return; }
+  const maxV = tm[0].visits || 1;
+  el.innerHTML = tm.map(m => {
+    const pct = Math.round((m.visits/maxV)*100);
+    return `<div class="topmove"><span class="san">${m.san}</span>
+      <span class="bar"><i style="width:${pct}%"></i></span>
+      <span class="v">${m.visits} visits · p=${m.prior}</span></div>`;
+  }).join('');
+}
+
+function renderMeta(s){
+  const dev = s.trained_from;
+  $('meta').innerHTML =
+    `Weights: <b>${dev}</b><br>` +
+    `MCTS sims/move: <b>${s.sims}</b><br>` +
+    `Last search: <b>${s.clock_ms} ms</b><br>` +
+    `Eval (net, white POV): <b>${(s.eval_white>=0?'+':'')+s.eval_white.toFixed(3)}</b>`;
+}
+
+function applyState(s){
+  // eval bar (white perspective -> fill from bottom)
+  const wscore = (s.eval_white + 1) / 2 * 100;
+  $('wfill').style.height = Math.max(0, Math.min(100, wscore)) + '%';
+
+  renderTopMoves(s.top_moves);
+  renderMeta(s);
+
+  // status text
+  const dot = $('dot');
+  if (s.status !== 'playing'){
+    $('statustext').textContent = s.result_text || 'game over';
+    $('status').textContent = s.result_text || 'game over';
+    $('status').classList.add('win');
+    dot.className = 'dot';
+  } else if (s.thinking){
+    const who = s.turn === 'w' ? 'White' : 'Black';
+    $('statustext').textContent = `${who} is thinking…`;
+    $('status').textContent = `${who} is thinking…`;
+    $('status').classList.remove('win');
+    dot.className = 'dot think';
+  } else {
+    const who = s.turn === 'w' ? 'White' : 'Black';
+    $('statustext').textContent = `${who} to move — move ${s.move_number}`;
+    $('status').textContent = `${who} to move — move ${s.move_number}`;
+    $('status').classList.remove('win');
+    dot.className = 'dot';
+  }
+
+  // re-render board only when a new move landed
+  if (s.ply !== lastPly){
+    lastPly = s.ply;
+    renderBoard(s.fen, s.last_move, s.check_square || null);
+    renderMoves(s.moves, s.ply);
+  }
+}
+
+async function poll(){
+  try{
+    const r = await fetch('/state', {cache:'no-store'});
+    const s = await r.json();
+    applyState(s);
+  }catch(e){ /* server may be restarting */ }
+}
+
+async function control(body){
+  await fetch('/control', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)});
+}
+
+$('btnNew').onclick = () => { control({action:'new'}); lastPly=-1; };
+$('btnPause').onclick = function(){
+  if (this.textContent === 'Pause'){ this.textContent='Resume'; control({action:'pause'}); }
+  else { this.textContent='Pause'; control({action:'resume'}); }
+};
+$('sims').onchange = e => control({sims:+e.target.value});
+
+poll();
+setInterval(poll, 350);
+window.addEventListener('resize', () => { /* board font handled on next re-render */ });
+</script>
+</body>
+</html>

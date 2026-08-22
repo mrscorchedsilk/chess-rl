@@ -1,0 +1,12 @@
+.venv/
+__pycache__/
+*.py[cod]
+checkpoints/
+backups/
+*.log
+training.jsonl
+stats.json
+*.pt
+.pytest_cache/
+.coverage
+htmlcov/
