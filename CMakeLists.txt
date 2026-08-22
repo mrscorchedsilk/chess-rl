@@ -7,6 +7,8 @@ find_package(pybind11 CONFIG REQUIRED)
 pybind11_add_module(_chess_rl_native MODULE native/chess_rl_native.cpp)
 target_compile_features(_chess_rl_native PRIVATE cxx_std_17)
 set_target_properties(_chess_rl_native PROPERTIES
+  CXX_STANDARD 17
+  CXX_STANDARD_REQUIRED ON
   CXX_EXTENSIONS OFF
   OUTPUT_NAME "_chess_rl_native"
 )
@@ -23,6 +25,10 @@ target_compile_definitions(_chess_rl_native PRIVATE
 install(TARGETS _chess_rl_native
   LIBRARY DESTINATION chess_rl_native
   RUNTIME DESTINATION chess_rl_native
+)
+install(FILES
+  LICENSE
+  DESTINATION chess_rl_native
 )
 install(FILES
   native/third_party/chess-library/LICENSE

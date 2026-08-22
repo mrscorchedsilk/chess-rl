@@ -20,10 +20,12 @@ def test_native_metadata_and_vendor_provenance():
 
     build_info = chess_rl_native.build_info()
     assert build_info["cxx_standard"] == "c++17"
+    assert build_info["cplusplus"] == 201703
     assert build_info["chess_library_commit"] == EXPECTED_COMMIT
     assert build_info["native_abi_version"] == "1"
 
     package_dir = Path(chess_rl_native.__file__).resolve().parent
+    package_license_path = package_dir / "LICENSE"
     provenance_path = package_dir / "third_party" / "chess-library" / "PROVENANCE.json"
     license_path = package_dir / "third_party" / "chess-library" / "LICENSE"
     header_path = package_dir / "third_party" / "chess-library" / "include" / "chess.hpp"
@@ -31,5 +33,7 @@ def test_native_metadata_and_vendor_provenance():
 
     assert provenance["commit"] == EXPECTED_COMMIT
     assert provenance["include/chess.hpp_sha256"] == EXPECTED_HEADER_SHA256
+    assert provenance["LICENSE_sha256"] == EXPECTED_LICENSE_SHA256
+    assert "MIT License" in package_license_path.read_text()
     assert hashlib.sha256(header_path.read_bytes()).hexdigest() == EXPECTED_HEADER_SHA256
     assert hashlib.sha256(license_path.read_bytes()).hexdigest() == EXPECTED_LICENSE_SHA256

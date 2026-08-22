@@ -13,13 +13,14 @@ name = "chess-rl-native"
 version = "0.1.0"
 description = "Native build foundation for chess-rl"
 requires-python = ">=3.9"
-license = { text = "MIT" }
+license = { file = "LICENSE" }
 
 [tool.scikit-build]
 minimum-version = "build-system.requires"
 build-dir = "build/{wheel_tag}"
 wheel.packages = ["src/chess_rl_native"]
 sdist.include = [
+  "LICENSE",
   "native/third_party/chess-library/include/chess.hpp",
   "native/third_party/chess-library/LICENSE",
   "native/third_party/chess-library/PROVENANCE.json",

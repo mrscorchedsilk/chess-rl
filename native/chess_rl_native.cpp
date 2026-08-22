@@ -17,6 +17,7 @@ static_assert(sizeof(PinnedChessBoard) > 0, "pinned chess.hpp did not compile");
 py::dict build_info() {
     py::dict info;
     info["cxx_standard"] = "c++17";
+    info["cplusplus"] = static_cast<long long>(__cplusplus);
     info["compiler"] = __VERSION__;
     info["native_abi_version"] = CHESS_RL_NATIVE_ABI_VERSION;
     info["chess_library_commit"] = CHESS_RL_NATIVE_CHESS_LIBRARY_COMMIT;

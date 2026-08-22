@@ -127,6 +127,14 @@ class TestValidation:
         with pytest.raises(ValueError, match="train_server"):
             make_runner(tmp_path, registry=reg)
 
+    @pytest.mark.parametrize("module", ["train", "train_server"])
+    def test_python_module_training_entrypoint_rejected(self, tmp_path, module):
+        reg = {"bad": gr.GateSpec(
+            id="bad", cmd=("{python}", "-m", module), cwd="repo",
+        )}
+        with pytest.raises(ValueError, match=module):
+            make_runner(tmp_path, registry=reg)
+
     def test_skip_gate_must_have_reason(self, tmp_path):
         reg = {"bad": gr.GateSpec(id="bad", kind="skip", skip_reason="")}
         with pytest.raises(ValueError, match="skip_reason"):
@@ -432,6 +440,42 @@ class TestParallelPipelineGate:
         summary = runner.run()
         assert summary["gates"][0]["status"] == "fail"
 
+    def test_stale_result_is_deleted_before_command(self, tmp_path):
+        evidence = tmp_path / "evidence-fixed"
+        evidence.mkdir()
+        (evidence / "pp.json").write_text('{"games":4,"wall_seconds":1.0}')
+        reg = {"pp": _pp_spec("{evidence}/pp.json", "pass")}
+        runner = make_runner(
+            tmp_path, registry=reg, selected=["pp"], evidence_dir=evidence,
+        )
+        summary = runner.run()
+        assert summary["gates"][0]["status"] == "fail"
+        assert "missing" in summary["gates"][0]["reason"].lower()
+
+    @pytest.mark.parametrize(
+        ("games_literal", "wall_literal"),
+        [
+            ("4.0", "1.0"),
+            ("True", "1.0"),
+            ("4", "float('nan')"),
+            ("4", "float('inf')"),
+            ("4", "-1.0"),
+            ("4", "True"),
+        ],
+    )
+    def test_invalid_result_types_or_nonfinite_timing_fail(
+        self, tmp_path, games_literal, wall_literal,
+    ):
+        code = (
+            "import json,sys;"
+            f"json.dump({{'games':{games_literal},'wall_seconds':{wall_literal}}},"
+            "open(sys.argv[1],'w'))"
+        )
+        reg = {"pp": _pp_spec("{evidence}/pp.json", code)}
+        runner = make_runner(tmp_path, registry=reg, selected=["pp"])
+        summary = runner.run()
+        assert summary["gates"][0]["status"] == "fail"
+
 
 # ---------------------------------------------------------------------------
 # Gate selection, overrides, and CLI
@@ -451,13 +495,25 @@ class TestSelectionAndCli:
         ids = [e["id"] for e in summary["gates"]]
         assert "fake_fail" not in ids
 
-    def test_skip_override_forces_skip_with_reason(self, tmp_path):
+    def test_skip_override_of_required_gate_remains_required_and_fails_closed(self, tmp_path):
         runner = make_runner(tmp_path, selected=["fake_fail"], skip=["fake_fail"])
         summary = runner.run()
         entry = summary["gates"][0]
         assert entry["status"] == "skip"
+        assert entry["required"] is True
         assert "explicitly-skipped" in entry["reason"]
+        assert runner.exit_code == gr.EXIT_REQUIRED_SKIPPED
+
+    def test_skip_override_of_optional_gate_can_succeed(self, tmp_path):
+        runner = make_runner(tmp_path, selected=["fake_skip"], skip=["fake_skip"])
+        runner.run()
         assert runner.exit_code == gr.EXIT_OK
+
+    def test_unknown_require_or_skip_gate_is_rejected(self, tmp_path):
+        with pytest.raises(ValueError, match="unknown.*require"):
+            make_runner(tmp_path, require=["does_not_exist"])
+        with pytest.raises(ValueError, match="unknown.*skip"):
+            make_runner(tmp_path, skip=["does_not_exist"])
 
     def test_require_override_promotes_optional_gate(self, tmp_path):
         runner = make_runner(tmp_path, selected=["fake_skip"], require=["fake_skip"])
@@ -511,24 +567,10 @@ class TestSelectionAndCli:
         runner.run()
         assert (tmp_path / "evidence" / "gates").is_dir()
 
-    def test_registry_file_override_uses_harmless_command(self, tmp_path):
-        registry_file = tmp_path / "registry.json"
-        registry_file.write_text(json.dumps({
-            "gates": {
-                "echo_ok": {
-                    "description": "harmless echo gate",
-                    "cmd": ["{python}", "-c", PASS_CODE],
-                    "cwd": "repo",
-                    "timeout_s": 10,
-                    "required": True,
-                    "kind": "command",
-                }
-            }
-        }))
+    def test_cli_rejects_arbitrary_registry_file_option(self):
         with pytest.raises(SystemExit) as exc:
-            gr.main(["--repo", str(tmp_path), "--registry-file",
-                     str(registry_file), "--gates", "echo_ok"])
-        assert exc.value.code == gr.EXIT_OK
+            gr.parse_args(["--registry-file", "/tmp/untrusted.json"])
+        assert exc.value.code == 2
 
 
 class TestRunId:

@@ -16,9 +16,10 @@ Guarantees
   artifacts do not exist in this checkout (native C++, GPU runtime, resume,
   canary) are explicit ``skip`` with reason ``missing-artifact: ...`` --
   never a false pass.
-* The runner never starts production training: registries containing the
-  known training entrypoints (``train.py`` / ``train_server.py``) are
-  rejected, and the canary gate is skip-only by construction.
+* The built-in CLI registry never starts production training: known training
+  entrypoints (``train.py``, ``train_server.py``, and their ``python -m`` forms)
+  are rejected, and the canary gate is skip-only by construction. Programmatic
+  registries are a trusted in-process testing/integration hook, not a CLI input.
 
 Summary schema (``summary.json``)::
 
@@ -65,14 +66,13 @@ Exit codes
 CLI::
 
     python scripts/gate_runner.py [--gates id1,id2] [--require id] [--skip id]
-        [--registry-file FILE] [--repo PATH] [--python PATH] [--evidence PATH]
+        [--repo PATH] [--python PATH] [--evidence PATH]
         [--light-chess-dir PATH] [--dashboard-dir PATH] [--list] [--version]
         [--no-probe]
 
 ``--gates`` selects a subset, ``--require`` promotes a gate to required and
-``--skip`` forces a skip (and demotes it from required). ``--registry-file``
-replaces/adds gate definitions so tests and alternate environments can use
-harmless commands. Placeholders in gate commands: ``{python}``, ``{repo}``,
+``--skip`` records an explicit skip without weakening required status.
+Placeholders in trusted in-process test registries: ``{python}``, ``{repo}``,
 ``{evidence}``, ``{light_chess}``, ``{dashboard}``.
 """
 
@@ -80,6 +80,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import platform
 import subprocess
@@ -268,11 +269,20 @@ def validate_registry(registry: dict) -> None:
             raise ValueError(f"gate {gid!r} has unknown kind {spec.kind!r}")
         if spec.cwd not in _CWD_MARKERS and not isinstance(spec.cwd, (str, os.PathLike)):
             raise ValueError(f"gate {gid!r} has invalid cwd {spec.cwd!r}")
-        for arg in spec.cmd:
+        for index, arg in enumerate(spec.cmd):
             if os.path.basename(arg) in FORBIDDEN_ENTRYPOINTS:
                 raise ValueError(
                     f"forbidden training entrypoint {os.path.basename(arg)!r} "
                     f"in gate {gid!r}; the gate runner must never start production training"
+                )
+            if (
+                arg == "-m"
+                and index + 1 < len(spec.cmd)
+                and spec.cmd[index + 1] in ("train", "train_server")
+            ):
+                raise ValueError(
+                    f"forbidden training module {spec.cmd[index + 1]!r} "
+                    f"in gate {gid!r}"
                 )
 
 
@@ -349,6 +359,12 @@ class GateRunner:
             self.selected_ids = [g for g in self.registry if g in selected]
         self.require = set(require or [])
         self.skip = set(skip or [])
+        unknown_require = sorted(self.require - set(self.registry))
+        unknown_skip = sorted(self.skip - set(self.registry))
+        if unknown_require:
+            raise ValueError(f"unknown require gate id(s): {', '.join(unknown_require)}")
+        if unknown_skip:
+            raise ValueError(f"unknown skip gate id(s): {', '.join(unknown_skip)}")
 
         # Validate cwd directories for every non-skip gate that will run.
         for gid in self.selected_ids:
@@ -554,17 +570,24 @@ class GateRunner:
             return result
         games = data.get("games")
         wall = data.get("wall_seconds")
-        if games != spec.check_games:
+        if type(games) is not int or games != spec.check_games:
             result["ok"] = False
             result["reason"] = (
-                f"four-game result: expected {spec.check_games} games, got {games}"
+                f"four-game result: expected integer {spec.check_games} games, "
+                f"got {games!r}"
             )
             return result
-        if wall is None or wall >= spec.check_max_wall_seconds:
+        if (
+            type(wall) not in (int, float)
+            or isinstance(wall, bool)
+            or not math.isfinite(wall)
+            or wall < 0.0
+            or wall >= spec.check_max_wall_seconds
+        ):
             result["ok"] = False
             result["reason"] = (
-                f"four-game result: wall={wall} s; requires "
-                f"< {spec.check_max_wall_seconds} s"
+                f"four-game result: wall={wall!r} s; requires a finite value "
+                f"in [0, {spec.check_max_wall_seconds})"
             )
             return result
         return result
@@ -592,8 +615,6 @@ class GateRunner:
             spec = self.registry[gid]
             forced_skip = gid in self.skip
             required = spec.required or gid in self.require
-            if forced_skip:
-                required = False  # explicit skip opts out of required
             if forced_skip or spec.kind == "skip":
                 reason = (
                     "explicitly-skipped"
@@ -619,6 +640,10 @@ class GateRunner:
 
             argv = [self._resolve(arg) for arg in spec.cmd]
             cwd = self._resolve_cwd(spec)
+            if spec.kind == "parallel_pipeline":
+                # A reused evidence directory must never let an old passing
+                # benchmark satisfy a command that failed to write fresh data.
+                Path(self._resolve(spec.check_json)).unlink(missing_ok=True)
             result = self._run_command(argv, cwd, spec)
             if spec.kind == "parallel_pipeline":
                 result = self._check_parallel_pipeline(spec, result)
@@ -708,9 +733,7 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument("--require", action="append", default=[],
                         help="promote a gate to required (repeatable)")
     parser.add_argument("--skip", action="append", default=[],
-                        help="force-skip a gate (repeatable; demotes required)")
-    parser.add_argument("--registry-file", default=None,
-                        help="JSON file overriding gate definitions")
+                        help="force-skip a gate (repeatable; required skips exit 2)")
     parser.add_argument("--repo", default=None,
                         help="repo root (default: parent of this file)")
     parser.add_argument("--python", default=None,
@@ -749,21 +772,14 @@ def main(argv=None, registry: dict | None = None) -> None:
         print(f"{SCHEMA_NAME} v{GATE_SCHEMA_VERSION}")
         raise SystemExit(EXIT_OK)
     if args.list:
-        reg = registry if registry is not None else (
-            load_registry_file(Path(args.registry_file))
-            if args.registry_file else DEFAULT_GATES
-        )
+        reg = registry if registry is not None else DEFAULT_GATES
         _print_listing(reg)
         raise SystemExit(EXIT_OK)
 
     try:
-        reg = registry
-        if reg is None:
-            reg = (
-                load_registry_file(Path(args.registry_file))
-                if args.registry_file
-                else DEFAULT_GATES
-            )
+        # ``registry`` is an in-process testing/integration hook. The public
+        # CLI intentionally exposes no arbitrary registry-file execution.
+        reg = registry if registry is not None else DEFAULT_GATES
         runner = GateRunner(
             registry=reg,
             repo_root=args.repo,
