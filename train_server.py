@@ -116,14 +116,17 @@ class Controller:
 
     # -- lifecycle ---------------------------------------------------------- #
 
-    def start(self, workers=8, resume=True):
+    def start(self, workers=8, resume=True, backend="python"):
         with self.lock:
             self._reap()
             if self.proc is not None:
                 return {"ok": False,
                         "error": "training already running (pid %s)" % self.proc.pid}
             workers = max(1, int(workers))
-            cmd = [PYTHON, TRAIN_SCRIPT, "--workers", str(workers)]
+            if backend == "native":
+                cmd = [PYTHON, TRAIN_SCRIPT, "--selfplay-backend", "native"]
+            else:
+                cmd = [PYTHON, TRAIN_SCRIPT, "--workers", str(workers)]
             if resume:
                 cmd.append("--resume")
 
@@ -152,9 +155,11 @@ class Controller:
             self.error = None
             self.workers = workers
             self.resume = resume
+            self.backend = backend
             self.run_id = "run-%d-%d" % (self.proc.pid, int(self.started_at))
             return {"ok": True, "pid": self.proc.pid, "workers": workers,
-                    "resume": resume, "run_id": self.run_id}
+                    "resume": resume, "backend": backend,
+                    "run_id": self.run_id}
 
     def stop(self):
         with self.lock:
@@ -494,6 +499,7 @@ def _status():
             "elapsed_s": elapsed,
             "workers": CTRL.workers,
             "resume": CTRL.resume,
+            "backend": getattr(CTRL, "backend", "python"),
             "run_id": run_id,
             "exit_code": CTRL.returncode,
             "error": CTRL.error,
@@ -607,6 +613,9 @@ class Handler(BaseHTTPRequestHandler):
             return self._json({"error": "JSON body must be an object"}, 400)
         action = data.get("action")
         if action == "start":
+            backend = data.get("backend", "python")
+            if backend not in ("python", "native"):
+                return self._json({"error": "backend must be 'python' or 'native'"}, 400)
             try:
                 workers = int(data.get("workers", 8))
             except (TypeError, ValueError):
@@ -616,7 +625,7 @@ class Handler(BaseHTTPRequestHandler):
             resume = data.get("resume", True)
             if not isinstance(resume, bool):
                 return self._json({"error": "resume must be a boolean"}, 400)
-            result = CTRL.start(workers=workers, resume=resume)
+            result = CTRL.start(workers=workers, resume=resume, backend=backend)
         elif action == "stop":
             result = CTRL.stop()
         else:

@@ -77,14 +77,27 @@ Actor::GatherResult Actor::gather_leaves(int max_batch) {
     leaf_game_.clear();
     game_base_.assign(games_.size() + 1, 0);
 
+    // `max_batch` is the TOTAL merged batch budget (the GPU runtime's fixed
+    // buckets cap it at 256).  Each in-play game gets an equal share so the
+    // merged total can never exceed max_batch.  Each game's MCTS is gathered
+    // EXACTLY ONCE per round (its pending list is consumed by the matching
+    // apply_evaluations), and its leaves stay contiguous so the game_base_
+    // routing in apply_evaluations holds.
+    int in_play = 0;
+    for (const GameState& game : games_)
+        if (!game.finished && !game.mcts.is_complete()) ++in_play;
+    if (in_play == 0) {
+        game_base_.assign(games_.size() + 1, 0);
+        return result;
+    }
+    const int per_game = std::max(1, max_batch / in_play);
+
     for (std::size_t g = 0; g < games_.size(); ++g) {
         GameState& game = games_[g];
         game_base_[g] = static_cast<int>(result.leaves.size());
         if (game.finished || game.mcts.is_complete()) continue;
 
-        // Each game's MCTS bounds the simulations by its own remaining
-        // budget; the game's search state is reused across gather/apply.
-        MCTS::GatherResult gr = game.mcts.gather_leaves(max_batch);
+        MCTS::GatherResult gr = game.mcts.gather_leaves(per_game);
         for (auto& leaf : gr.leaves) {
             leaf_game_.push_back(static_cast<int>(g));
             result.leaves.push_back(std::move(leaf));
