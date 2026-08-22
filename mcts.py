@@ -83,11 +83,13 @@ class MCTS:
 
     # ------------------------------------------------------------ public API
 
-    def search(self, board, temperature=0.0, num_sims=None):
+    def search(self, board, temperature=0.0, num_sims=None, add_root_noise=True):
         """Run a search from `board` and return {chess.Move: probability}.
 
         num_sims defaults to cfg.num_simulations.  temperature == 0 returns a
-        one-hot distribution over the most-visited move.
+        one-hot distribution over the most-visited move.  add_root_noise=False
+        suppresses the Dirichlet root exploration (arena matches rely on this
+        to stay deterministic).
         """
         if num_sims is None:
             num_sims = self.cfg.num_simulations
@@ -95,11 +97,15 @@ class MCTS:
         self._board = board.copy()  # own copy; the caller keeps theirs
         self.root = Node()
 
-        if self._board.is_game_over():
-            return self._get_policy(temperature)
+        # Terminal roots (checkmate, stalemate, insufficient material, the
+        # automatic fifty/75-move and fivefold rules, AND claimable draws such
+        # as threefold repetition) produce an empty policy: there is no move.
+        if self._board.is_game_over(claim_draw=True):
+            return {}
 
         self._expand_root()
-        self._apply_dirichlet_noise(self.root)
+        if add_root_noise:
+            self._apply_dirichlet_noise(self.root)
 
         batch_size = max(1, int(getattr(self.cfg, "batch_size", 1)))
         virtual_loss = float(getattr(self.cfg, "virtual_loss", 3.0))
@@ -139,9 +145,9 @@ class MCTS:
                          prior=float(probs[encoding.move_to_index(move)]))
             node.children[move] = child
 
-        # Re-normalise: the 4096 from->to encoding cannot distinguish
-        # promotion pieces, so a promotion position would otherwise carry
-        # duplicate priors that sum to more than one.
+        # Defensive re-normalisation: keeps child priors summing to exactly 1
+        # (softmax already assigns mass only to legal moves, but the division
+        # guards against float drift and any duplicated-move edge cases).
         total = sum(c.P for c in node.children.values())
         if total > 0.0:
             for child in node.children.values():
@@ -162,9 +168,11 @@ class MCTS:
                 self._board.push(node.move)
 
             # ---- resolve the leaf: terminal / game-over / needs-eval ----
+            # Claimable draws (threefold repetition, fifty-move claim) count as
+            # terminal here so search, self-play and arena all agree.
             if node.is_terminal:
                 leaf_kind, leaf_val = "terminal", node.terminal_value
-            elif self._board.is_game_over():
+            elif self._board.is_game_over(claim_draw=True):
                 node.is_terminal = True
                 node.terminal_value = self._terminal_value(self._board)
                 leaf_kind, leaf_val = "terminal", node.terminal_value
@@ -234,7 +242,9 @@ class MCTS:
             return
         eps = self.cfg.dirichlet_epsilon
         alpha = self.cfg.dirichlet_alpha
-        noise = np.random.default_rng().dirichlet([alpha] * len(node.children))
+        # Use NumPy's checkpointed global RNG so cfg.seed and restored RNG state
+        # reproduce self-play exploration across resumes and worker processes.
+        noise = np.random.dirichlet([alpha] * len(node.children))
         for child, eta in zip(node.children.values(), noise):
             child.P = (1.0 - eps) * child.P + eps * float(eta)
 

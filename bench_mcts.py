@@ -13,6 +13,13 @@ from model import ChessNet
 from mcts import MCTS
 import encoding
 
+
+def sync_device(device):
+    """Synchronize only CUDA benchmarks; CPU runs need no device barrier."""
+    if str(device).startswith("cuda"):
+        torch.cuda.synchronize()
+
+
 def main():
     cfg = Config()
     print(f"device={cfg.device}  num_simulations={cfg.num_simulations}")
@@ -48,11 +55,11 @@ def main():
     with torch.no_grad():
         for _ in range(10):
             net(x)
-        torch.cuda.synchronize()
+        sync_device(cfg.device)
         t0 = time.time()
         for _ in range(200):
             net(x)
-        torch.cuda.synchronize()
+        sync_device(cfg.device)
         dt = (time.time() - t0) / 200
     print(f"batch=1 forward: {dt*1000:.2f} ms/call")
     # batch of 32
@@ -60,11 +67,11 @@ def main():
     with torch.no_grad():
         for _ in range(10):
             net(x32)
-        torch.cuda.synchronize()
+        sync_device(cfg.device)
         t0 = time.time()
         for _ in range(200):
             net(x32)
-        torch.cuda.synchronize()
+        sync_device(cfg.device)
         dt32 = (time.time() - t0) / 200
     print(f"batch=32 forward: {dt32*1000:.2f} ms/call  (per-pos: {dt32/32*1000:.3f} ms)")
 

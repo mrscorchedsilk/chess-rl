@@ -12,21 +12,22 @@ from mcts import MCTS
 
 
 def _terminal_result(board):
-    """Return (is_terminal, white_result); same rules as selfplay."""
-    if board.is_checkmate():
-        return True, -1.0 if board.turn == chess.WHITE else 1.0
-    if (
-        board.is_stalemate()
-        or board.is_insufficient_material()
-        or board.is_repetition(3)
-        or board.is_fifty_moves()
-    ):
+    """Return (is_terminal, white_result); same rules as selfplay and MCTS
+    (outcome(claim_draw=True) — claimable draws are terminal everywhere)."""
+    outcome = board.outcome(claim_draw=True)
+    if outcome is None:
+        return False, None
+    if outcome.winner is None:
         return True, 0.0
-    return False, None
+    return True, 1.0 if outcome.winner == chess.WHITE else -1.0
 
 
 def _play_arena_game(mcts_white, mcts_black, cfg, num_sims):
-    """Play one arena game; return the result from White's perspective."""
+    """Play one arena game; return the result from White's perspective.
+
+    Arena searches use temperature 0.0 and NO Dirichlet root noise
+    (cfg.arena_root_noise is False), so repeated matches are deterministic.
+    """
     board = chess.Board()
     while True:
         if len(board.move_stack) >= cfg.max_game_length:
@@ -36,7 +37,10 @@ def _play_arena_game(mcts_white, mcts_black, cfg, num_sims):
             return white_result
 
         searcher = mcts_white if board.turn == chess.WHITE else mcts_black
-        pi = searcher.search(board, temperature=0.0, num_sims=num_sims)
+        pi = searcher.search(
+            board, temperature=0.0, num_sims=num_sims,
+            add_root_noise=cfg.arena_root_noise,
+        )
         move = max(pi, key=pi.get)
         board.push(move)
 

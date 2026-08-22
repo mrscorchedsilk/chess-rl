@@ -2,8 +2,8 @@
 
 play_game(net, cfg) -> list of (state, pi, z) training examples:
 
-    state  (18, 8, 8) float32  -- encoding.encode_board(board)
-    pi     (4096,)    float32  -- MCTS visit distribution as flat policy vector
+    state  (104, 8, 8) float32  -- eight-position history + rule metadata
+    pi     (4672,)      float32  -- MCTS visit distribution over 73 move planes
     z      float in {-1.0, 0.0, 1.0} -- outcome from the side-to-move's view
 """
 
@@ -18,20 +18,18 @@ def _terminal_result(board):
     """Return (is_terminal, white_result) for the given board.
 
     white_result: 1.0 = White won, -1.0 = Black won, 0.0 = draw.
-    Checkmate, stalemate, insufficient material, threefold repetition and
-    the fifty-move rule all terminate the game.
+    Checkmate, stalemate, insufficient material, the automatic 75-move and
+    fivefold rules, AND the claimable draws (fifty-move rule, threefold
+    repetition) all terminate the game — exactly the same predicate MCTS uses
+    (board.outcome(claim_draw=True) / is_game_over(claim_draw=True)), so
+    search, self-play and arena agree on claimable draw terminal states.
     """
-    if board.is_checkmate():
-        # The side to move is checkmated, so the other side won.
-        return True, -1.0 if board.turn == chess.WHITE else 1.0
-    if (
-        board.is_stalemate()
-        or board.is_insufficient_material()
-        or board.is_repetition(3)
-        or board.is_fifty_moves()
-    ):
+    outcome = board.outcome(claim_draw=True)
+    if outcome is None:
+        return False, None
+    if outcome.winner is None:
         return True, 0.0
-    return False, None
+    return True, 1.0 if outcome.winner == chess.WHITE else -1.0
 
 
 def _select_move(pi, temperature):

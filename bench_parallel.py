@@ -52,12 +52,13 @@ def cpu_util():
         return -1.0
 
 
-def validate(examples):
+def validate(examples, cfg=None):
     """Check every (state, pi, z) tuple is well-formed and legal."""
+    cfg = cfg or Config()
     for state, pi, z in examples:
-        assert state.shape == (18, 8, 8), state.shape
+        assert state.shape == (cfg.num_input_planes, cfg.board_size, cfg.board_size), state.shape
         assert state.dtype == np.float32
-        assert pi.shape == (4096,), pi.shape
+        assert pi.shape == (cfg.policy_size,), pi.shape
         assert pi.dtype == np.float32
         assert abs(float(pi.sum()) - 1.0) < 1e-3, f"pi sums to {pi.sum()}"
         assert float(pi.min()) >= 0.0
@@ -86,7 +87,7 @@ def main():
     if args.load_best:
         best = os.path.join(cfg.checkpoint_dir, "best.pt")
         if os.path.exists(best):
-            net.load_state_dict(torch.load(best, map_location=cfg.device))
+            net.load_state_dict(torch.load(best, map_location=cfg.device, weights_only=True))
             print("loaded best.pt", flush=True)
     search_net = ChessNet(cfg).to(cfg.device)
     search_net.load_state_dict(net.state_dict())
