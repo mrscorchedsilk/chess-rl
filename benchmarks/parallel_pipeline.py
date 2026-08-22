@@ -13,8 +13,10 @@ import json
 import multiprocessing as mp
 import os
 from pathlib import Path
+import platform
 import queue
 import statistics
+import subprocess
 import sys
 import time
 
@@ -23,10 +25,47 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 import numpy as np
+import torch
 
 from config import Config
 from model import ChessNet
 from parallel import InferenceServer, worker_loop
+
+
+def _seed_benchmark(seed):
+    """Pin parent model initialization and benchmark-side RNGs."""
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+def _git_output(*args):
+    result = subprocess.run(
+        ["git", *args], cwd=ROOT, capture_output=True, text=True, timeout=10,
+        check=True,
+    )
+    return result.stdout.strip()
+
+
+def host_fingerprint():
+    """Return enough machine/software identity to interpret a benchmark."""
+    gpu = None
+    if torch.cuda.is_available():
+        props = torch.cuda.get_device_properties(0)
+        gpu = {
+            "name": props.name,
+            "total_memory_mib": int(props.total_memory // (1024 * 1024)),
+            "capability": list(torch.cuda.get_device_capability(0)),
+        }
+    return {
+        "python": platform.python_version(),
+        "torch": torch.__version__,
+        "cuda_runtime": torch.version.cuda,
+        "gpu": gpu,
+        "git_commit": _git_output("rev-parse", "HEAD"),
+        "git_dirty": bool(_git_output("status", "--porcelain")),
+    }
 
 
 def summarize_profile(rows):
@@ -109,11 +148,15 @@ def run_benchmark(args):
     cfg.result_timeout_seconds = args.timeout
     setattr(cfg, "inference_timeout_seconds", args.timeout)
 
-    profile_path = Path(args.profile_jsonl).resolve()
-    profile_path.parent.mkdir(parents=True, exist_ok=True)
-    profile_path.unlink(missing_ok=True)
-    os.environ["CHESS_PROFILE_JSONL"] = str(profile_path)
+    profile_path = Path(args.profile_jsonl).resolve() if args.profile_jsonl else None
+    if profile_path is not None:
+        profile_path.parent.mkdir(parents=True, exist_ok=True)
+        profile_path.unlink(missing_ok=True)
+        os.environ["CHESS_PROFILE_JSONL"] = str(profile_path)
+    else:
+        os.environ.pop("CHESS_PROFILE_JSONL", None)
 
+    _seed_benchmark(cfg.seed)
     net = ChessNet(cfg).to(cfg.device)
     net.eval()
 
@@ -188,12 +231,14 @@ def run_benchmark(args):
 
     for game in games:
         _validate_game(game, cfg)
-    rows = _read_jsonl(profile_path)
+    rows = _read_jsonl(profile_path) if profile_path is not None else []
     profile = summarize_profile(rows)
     result = {
         "schema": 1,
         "backend": "python-processes",
         "device": str(cfg.device),
+        "host": host_fingerprint(),
+        "model_parameters": sum(parameter.numel() for parameter in net.parameters()),
         "workers": args.workers,
         "games": len(games),
         "simulations": args.sims,
@@ -202,7 +247,7 @@ def run_benchmark(args):
         "wall_seconds": wall_seconds,
         "games_per_hour": len(games) / wall_seconds * 3600.0,
         "examples": sum(len(game) for game in games),
-        "profile_jsonl": str(profile_path),
+        "profile_jsonl": str(profile_path) if profile_path is not None else None,
         "profile": profile,
     }
     if len(games) == 4:
@@ -219,7 +264,8 @@ def parse_args(argv=None):
     parser.add_argument("--max-plies", type=int, default=400)
     parser.add_argument("--timeout", type=float, default=90.0)
     parser.add_argument("--device", choices=("cpu", "cuda"), default=None)
-    parser.add_argument("--profile-jsonl", default="/tmp/chess-parallel-profile.jsonl")
+    parser.add_argument("--profile-jsonl", default=None,
+                        help="Enable expensive diagnostic JSONL profiling at this path")
     parser.add_argument("--json", dest="json_path", default=None)
     return parser.parse_args(argv)
 

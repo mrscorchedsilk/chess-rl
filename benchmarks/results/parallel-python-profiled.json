@@ -1,0 +1,35 @@
+{
+  "backend": "python-processes",
+  "device": "cuda",
+  "examples_collected": 487,
+  "games_collected": 4,
+  "host_git_commit": "28e49859e87835b4ff671d04b179b23ea41326b4",
+  "profile": {
+    "batch_positions": {"count": 3208, "max": 104, "median": 8.0, "min": 1},
+    "event_counts": {
+      "batch_formed": 3208,
+      "game_completed": 6,
+      "game_started": 8,
+      "inference_batch_completed": 3208,
+      "inference_reply_received": 4054,
+      "inference_reply_sent": 4054,
+      "inference_request_sent": 4054,
+      "ply_completed": 1352,
+      "worker_started": 4
+    },
+    "games_completed_before_shutdown": 6,
+    "plies_completed_before_shutdown": 787,
+    "timing_ms": {
+      "d2h": 579.1591439999997,
+      "forward": 8115.248658999991,
+      "h2d": 664.6749650000017,
+      "legal": 12747.861361000008,
+      "total": 22106.944128999967
+    },
+    "transfer_fraction_of_measured_batch": 0.05626440731662842
+  },
+  "schema": 1,
+  "simulations": 40,
+  "wall_seconds": 62.4905228159987,
+  "workers": 4
+}

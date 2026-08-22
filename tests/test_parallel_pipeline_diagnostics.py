@@ -10,7 +10,12 @@ import numpy as np
 import torch
 
 import parallel
-from benchmarks.parallel_pipeline import summarize_profile
+from benchmarks.parallel_pipeline import (
+    _seed_benchmark,
+    host_fingerprint,
+    parse_args,
+    summarize_profile,
+)
 
 
 def test_profile_event_is_noop_when_disabled(tmp_path, monkeypatch):
@@ -151,3 +156,32 @@ def test_summarize_profile_reports_batch_and_transfer_breakdown():
     assert summary["timing_ms"]["d2h"] == 3.0
     assert summary["timing_ms"]["legal"] == 6.0
     assert summary["transfer_fraction_of_measured_batch"] == 4.5 / 18.5
+
+
+def test_host_fingerprint_records_reproducibility_context():
+    fingerprint = host_fingerprint()
+
+    assert fingerprint["python"]
+    assert fingerprint["torch"]
+    assert len(fingerprint["git_commit"]) == 40
+    assert fingerprint["git_dirty"] in (True, False)
+    assert "cuda_runtime" in fingerprint
+    assert "gpu" in fingerprint
+
+
+def test_benchmark_seed_reproduces_parent_numpy_and_torch_rng():
+    _seed_benchmark(42)
+    first_np = np.random.random(4)
+    first_torch = torch.rand(4)
+
+    _seed_benchmark(42)
+    second_np = np.random.random(4)
+    second_torch = torch.rand(4)
+
+    assert np.array_equal(first_np, second_np)
+    assert torch.equal(first_torch, second_torch)
+
+
+def test_benchmark_profiling_is_opt_in():
+    args = parse_args([])
+    assert args.profile_jsonl is None
