@@ -2,14 +2,29 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cstdlib>
 #include <limits>
 #include <sstream>
 #include <stdexcept>
 #include <string>
 #include <utility>
 
+#include "policy.h"
+
 namespace chess_rl_native {
 namespace {
+
+// Extract the raw 4th FEN field (en-passant square) verbatim: "-" or a square
+// name. The FEN is assumed already validated by valid_fen().
+std::string raw_ep_field(std::string_view fen) {
+    std::istringstream input{std::string(fen)};
+    std::string placement;
+    std::string active_color;
+    std::string castling;
+    std::string ep;
+    input >> placement >> active_color >> castling >> ep;
+    return ep;
+}
 
 bool all_decimal(std::string_view value) {
     return !value.empty() && std::all_of(value.begin(), value.end(), [](unsigned char c) {
@@ -168,6 +183,28 @@ bool is_insufficient_material(const chess::Board& board) {
            has_insufficient_material(board, chess::Color::BLACK);
 }
 
+constexpr int NUM_PIECE_TYPES = 6;  // PAWN..KING
+
+// Encode the 12 piece planes for one history step (offset = step * 12) from
+// `board` into `data` (a flat (planes, 8, 8) float buffer, plane-major with
+// each plane laid out rank 0..7 x file 0..7). Bitboard bit `sq` (square index
+// rank*8+file, a1=0) maps to plane element `sq`, matching encoding.py
+// _bb_to_plane (numpy unpackbits little-endian over the uint64).
+void encode_piece_planes(const chess::Board& board, float* data, int step) {
+    const int off = step * 12;
+    for (int pt = 0; pt < NUM_PIECE_TYPES; ++pt) {
+        const chess::PieceType type(static_cast<chess::PieceType::underlying>(pt));
+        const std::uint64_t white = board.pieces(type, chess::Color::WHITE).getBits();
+        const std::uint64_t black = board.pieces(type, chess::Color::BLACK).getBits();
+        float* wp = data + (off + pt) * 64;
+        float* bp = data + (off + pt + 6) * 64;
+        for (int sq = 0; sq < 64; ++sq) {
+            wp[sq] = ((white >> sq) & 1ULL) ? 1.0f : 0.0f;
+            bp[sq] = ((black >> sq) & 1ULL) ? 1.0f : 0.0f;
+        }
+    }
+}
+
 std::uint64_t perft_board(chess::Board& board, int depth) {
     if (depth == 0) return 1;
     chess::Movelist moves;
@@ -186,6 +223,7 @@ std::uint64_t perft_board(chess::Board& board, int depth) {
 Position Position::from_fen(std::string_view fen) {
     if (!valid_fen(fen)) throw std::invalid_argument("invalid FEN");
     Position position;
+    position.raw_ep_sq_ = raw_ep_field(fen);
     if (!position.board_.setFen(fen)) throw std::invalid_argument("invalid FEN");
     return position;
 }
@@ -268,6 +306,12 @@ std::optional<Outcome> Position::outcome(bool claim_draw) const {
     if (is_repetition(3)) return Outcome{"", "threefold_repetition"};
     for (const auto& move : moves) {
         Position after = *this;
+        // Mirror push_uci's raw en-passant bookkeeping so the copy stays
+        // consistent with history_ (pop() reads raw_ep_stack_ in lockstep).
+        const bool double_push = after.board_.at<chess::PieceType>(move.from()) == chess::PieceType::PAWN &&
+                                 std::abs(move.to().index() - move.from().index()) == 16;
+        after.raw_ep_stack_.push_back(after.raw_ep_sq_);
+        after.raw_ep_sq_ = double_push ? static_cast<std::string>(move.to().ep_square()) : "-";
         after.history_uci_.push_back(move_uci(after.board_, move));
         after.board_.makeMove<true>(move);
         after.history_.push_back(move);
@@ -295,6 +339,14 @@ void Position::push_uci(std::string_view uci) {
     chess::movegen::legalmoves(moves, board_);
     for (const auto& move : moves) {
         if (move_uci(board_, move) == uci) {
+            // python-chess raw en-passant semantics: the skipped square is
+            // recorded after ANY pawn double push (white rank 2 -> rank 4,
+            // black rank 7 -> rank 5), regardless of whether a legal capture
+            // exists; any other move clears it.
+            const bool double_push = board_.at<chess::PieceType>(move.from()) == chess::PieceType::PAWN &&
+                                     std::abs(move.to().index() - move.from().index()) == 16;
+            raw_ep_stack_.push_back(raw_ep_sq_);
+            raw_ep_sq_ = double_push ? static_cast<std::string>(move.to().ep_square()) : "-";
             board_.makeMove<true>(move);
             history_.push_back(move);
             history_uci_.emplace_back(uci);
@@ -309,6 +361,8 @@ void Position::pop() {
     board_.unmakeMove(history_.back());
     history_.pop_back();
     history_uci_.pop_back();
+    raw_ep_sq_ = raw_ep_stack_.back();
+    raw_ep_stack_.pop_back();
 }
 
 std::string Position::side_to_move() const {
@@ -327,6 +381,73 @@ std::string Position::castling_rights() const {
 std::string Position::ep_square() const {
     const auto square = board_.enpassantSq();
     return square == chess::Square::NO_SQ ? "-" : square_uci(square);
+}
+
+std::string Position::raw_ep_square() const { return raw_ep_sq_; }
+
+std::vector<int> Position::legal_move_indices() const {
+    chess::Movelist moves;
+    chess::movegen::legalmoves(moves, board_);
+    std::vector<int> result;
+    result.reserve(static_cast<std::size_t>(moves.size()));
+    for (const auto& move : moves) {
+        result.push_back(move_to_index(move_uci(board_, move)));
+    }
+    std::sort(result.begin(), result.end());
+    return result;
+}
+
+std::string Position::index_to_move(int index) const {
+    const bool white = board_.sideToMove() == chess::Color::WHITE;
+    const int from = index / POLICY_PLANES;
+    const bool from_is_pawn = board_.at<chess::PieceType>(chess::Square(from)) == chess::PieceType::PAWN;
+    return index_to_move_impl(index, white, from_is_pawn);
+}
+
+void Position::encode_planes(float* out, int history_steps) const {
+    if (history_steps < 1) throw std::invalid_argument("history_steps must be positive");
+
+    const int num_planes = 12 * history_steps + 8;
+    float* data = out;
+    std::fill(data, data + num_planes * 64, 0.0f);
+
+    // History piece planes, most recent first (current position = step 0);
+    // positions before game start stay all-zero.
+    Position snapshot = *this;
+    for (int step = 0; step < history_steps; ++step) {
+        encode_piece_planes(snapshot.board_, data, step);
+        if (snapshot.history_.empty()) break;
+        snapshot.pop();
+    }
+
+    // Meta planes (offset 12*history_steps) from the CURRENT position.
+    const int meta = 12 * history_steps;
+    const bool white = board_.sideToMove() == chess::Color::WHITE;
+    const std::string castling = castling_rights();
+    const float wk = castling.find('K') != std::string::npos ? 1.0f : 0.0f;
+    const float wq = castling.find('Q') != std::string::npos ? 1.0f : 0.0f;
+    const float bk = castling.find('k') != std::string::npos ? 1.0f : 0.0f;
+    const float bq = castling.find('q') != std::string::npos ? 1.0f : 0.0f;
+    const float halfmove = static_cast<float>(board_.halfMoveClock() / 100.0);
+    const float repetition = is_repetition(2) ? 1.0f : 0.0f;
+
+    for (int sq = 0; sq < 64; ++sq) {
+        data[(meta + 0) * 64 + sq] = white ? 1.0f : 0.0f;
+        data[(meta + 1) * 64 + sq] = wk;
+        data[(meta + 2) * 64 + sq] = wq;
+        data[(meta + 3) * 64 + sq] = bk;
+        data[(meta + 4) * 64 + sq] = bq;
+        data[(meta + 6) * 64 + sq] = halfmove;
+        data[(meta + 7) * 64 + sq] = repetition;
+    }
+
+    // En-passant target square (single 1.0 at the raw square, verbatim FEN
+    // field / last double-push skip square -- NOT legal-EP semantics).
+    if (raw_ep_sq_ != "-") {
+        const int file = raw_ep_sq_[0] - 'a';
+        const int rank = raw_ep_sq_[1] - '1';
+        data[(meta + 5) * 64 + rank * 8 + file] = 1.0f;
+    }
 }
 
 std::uint64_t perft(std::string_view fen, int depth) {

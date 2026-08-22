@@ -8,6 +8,7 @@ enable_testing()
 
 add_library(chess_rl_native_core STATIC
   native/position.cpp
+  native/policy.cpp
 )
 target_compile_features(chess_rl_native_core PUBLIC cxx_std_17)
 set_target_properties(chess_rl_native_core PROPERTIES

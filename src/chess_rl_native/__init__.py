@@ -7,6 +7,21 @@ __version__ = "0.1.0"
 Position = _native.Position
 perft = _native.perft
 
+# Policy / action-map constants (AlphaZero 73-plane policy).
+POLICY_PLANES = _native.POLICY_PLANES
+POLICY_SIZE = _native.POLICY_SIZE
+QUEEN_PLANES = _native.QUEEN_PLANES
+KNIGHT_PLANES = _native.KNIGHT_PLANES
+UNDERPROMOTION_PLANES = _native.UNDERPROMOTION_PLANES
+
+# Action map.
+move_to_index = _native.move_to_index
+index_to_move = _native.index_to_move
+policy_to_vector = _native.policy_to_vector
+
+# Encoder.
+encode_fen = _native.encode_fen
+
 
 def native_abi_version() -> str:
     return _native.native_abi_version()
@@ -28,6 +43,15 @@ __all__ = [
     "__version__",
     "Position",
     "perft",
+    "POLICY_PLANES",
+    "POLICY_SIZE",
+    "QUEEN_PLANES",
+    "KNIGHT_PLANES",
+    "UNDERPROMOTION_PLANES",
+    "move_to_index",
+    "index_to_move",
+    "policy_to_vector",
+    "encode_fen",
     "native_abi_version",
     "chess_library_commit",
     "chess_library_header_sha256",
