@@ -46,6 +46,7 @@ worker or a stuck queue becomes a bounded RuntimeError, never an unbounded
 Queue.get() hang.  Legacy raw-example lists are still accepted.
 """
 
+import hashlib
 import json
 import os
 import queue
@@ -64,12 +65,30 @@ from model import ChessNet
 from selfplay import play_game
 from arena import play_match
 from parallel import InferenceServer, worker_loop
-from replay import ReplayBuffer
+from replay import ReplayBuffer, PinnedReplayLoader
 
 Adam = torch.optim.Adam  # module alias so tests can substitute a spy
 
+# NOTE (schema versioning): the on-disk ``schema_version`` integer stays 2 —
+# the existing v2 suite pins ``payload["schema_version"] == CHECKPOINT_SCHEMA_VERSION == 2``.
+# The Task 8 "schema-v3" feature layer (architecture_id, AMP GradScaler state,
+# actor RNG, replay/config compatibility fields, version-aware validation) is
+# carried on top: every new checkpoint additionally marks
+# ``checkpoint_format == "schema-v3"`` and is validated BEFORE any
+# load_state_dict.  Unknown future schemas raise IncompatibleCheckpointError
+# and are never labeled "v1".
 CHECKPOINT_SCHEMA_VERSION = 2
+CHECKPOINT_FORMAT_V3 = "schema-v3"
 METRICS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "training.jsonl")
+
+# Training-state parameters that must match the checkpoint or resume is
+# silently corrupt: body identity, tensor sizes, optimizer shape and the
+# sampled-minibatch schedule.  Checked by the version-aware loader.
+CRITICAL_CONFIG_KEYS = (
+    "architecture_id", "num_res_blocks", "num_filters", "num_input_planes",
+    "board_size", "policy_planes", "policy_size", "learning_rate",
+    "weight_decay", "train_batch_size", "training_epochs", "replay_buffer_size",
+)
 
 
 class IncompatibleCheckpointError(RuntimeError):
@@ -161,6 +180,53 @@ def _seed_all(seed):
 
 
 # --------------------------------------------------------------------------- #
+#  schema-v3 compatibility helpers (Task 8)                                   #
+# --------------------------------------------------------------------------- #
+
+def _device_type(device):
+    """'cuda' | 'cpu' — backend identity stored in / validated against
+    checkpoints (a CUDA-trained run with AMP scaler state must not silently
+    resume on CPU)."""
+    return "cuda" if str(device).split(":")[0] == "cuda" else "cpu"
+
+
+def _config_fingerprint(cfg):
+    """Stable hash of the CRITICAL_CONFIG_KEYS subset of a config.  Two runs
+    with different critical configs get different fingerprints, so a resume
+    with silently-changed training semantics is rejected."""
+    snap = {}
+    for k in CRITICAL_CONFIG_KEYS:
+        snap[k] = getattr(cfg, k, None)
+    return hashlib.sha256(
+        json.dumps(snap, sort_keys=True, default=str).encode("utf-8")
+    ).hexdigest()[:16]
+
+
+def _amp_enabled(cfg, device):
+    """Mixed precision is on only for real CUDA devices (CPU training stays
+    FP32 and the GradScaler becomes a passthrough)."""
+    return bool(
+        getattr(cfg, "amp", True)
+        and _device_type(device) == "cuda"
+        and torch.cuda.is_available()
+    )
+
+
+def _make_grad_scaler(enabled):
+    """torch.amp.GradScaler with a fallback for older torch versions."""
+    try:
+        device_type = "cuda" if torch.cuda.is_available() else "cpu"
+        return torch.amp.GradScaler(device_type, enabled=bool(enabled))
+    except (AttributeError, TypeError):  # pragma: no cover - torch < 2.3
+        return torch.cuda.amp.GradScaler(enabled=bool(enabled))
+
+
+def _new_scaler(cfg, device):
+    """Persistent GradScaler owned by the training loop (checkpointed)."""
+    return _make_grad_scaler(_amp_enabled(cfg, device))
+
+
+# --------------------------------------------------------------------------- #
 #  checkpointing (schema_version=2)                                            #
 # --------------------------------------------------------------------------- #
 
@@ -169,6 +235,7 @@ def _checkpoint_paths(cfg):
         "best": os.path.join(cfg.checkpoint_dir, "best.pt"),
         "latest": os.path.join(cfg.checkpoint_dir, "latest.pt"),
         "meta": os.path.join(cfg.checkpoint_dir, "checkpoint_meta.json"),
+        "best_meta": os.path.join(cfg.checkpoint_dir, "best_meta.json"),
     }
 
 
@@ -177,20 +244,55 @@ def _timestamp():
 
 
 def _save_best_atomic(cfg, net):
-    """Atomically publish arena-accepted weights for serving/evaluation."""
-    path = _checkpoint_paths(cfg)["best"]
-    tmp = path + ".tmp"
+    """Atomically publish arena-accepted weights for serving/evaluation.
+
+    Legacy signature kept for callers that have no run metadata; delegates to
+    the transactional pair writer ``_publish_best``.
+    """
+    return _publish_best(cfg, net)
+
+
+def _publish_best(cfg, net, *, run_id=None, iteration=None, generation=None,
+                  architecture_id=None):
+    """Transactionally publish ``best.pt`` + ``best_meta.json`` as ONE pair.
+
+    ``best_meta.json`` records the TRUE accepted generation at publish time —
+    never inferred from iteration filenames — so a serving/arena consumer can
+    tell exactly which generation the weights correspond to, and resume can
+    detect (and repair) a best that ran ahead of or behind ``latest.pt``.
+    Both files are written via tmp + atomic replace.
+    """
+    paths = _checkpoint_paths(cfg)
+    tmp = paths["best"] + ".tmp"
     torch.save(net.state_dict(), tmp)
-    os.replace(tmp, path)
-    return path
+    os.replace(tmp, paths["best"])
+    meta = {
+        "schema_version": CHECKPOINT_SCHEMA_VERSION,
+        "checkpoint_format": CHECKPOINT_FORMAT_V3,
+        "run_id": run_id,
+        "iteration": None if iteration is None else int(iteration),
+        "generation": None if generation is None else int(generation),
+        "architecture_id": architecture_id
+        or getattr(net, "architecture_id", None),
+        "policy_size": int(getattr(cfg, "policy_size", 0)),
+        "num_input_planes": int(getattr(cfg, "num_input_planes", 0)),
+        "board_size": int(getattr(cfg, "board_size", 0)),
+        "saved_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+    }
+    tmp_meta = paths["best_meta"] + ".tmp"
+    with open(tmp_meta, "w") as f:
+        json.dump(meta, f, indent=2, sort_keys=True)
+    os.replace(tmp_meta, paths["best_meta"])
+    return paths["best"]
 
 
 def _save_meta(cfg, *, run_id, iteration, generation, optimizer_steps,
-               replay_size, reason):
+               replay_size, reason, architecture_id=None):
     """Atomically write checkpoint_meta.json next to latest.pt."""
     paths = _checkpoint_paths(cfg)
     meta = {
         "schema_version": CHECKPOINT_SCHEMA_VERSION,
+        "checkpoint_format": CHECKPOINT_FORMAT_V3,
         "run_id": run_id,
         "iteration": int(iteration),
         "generation": int(generation),
@@ -198,6 +300,7 @@ def _save_meta(cfg, *, run_id, iteration, generation, optimizer_steps,
         "replay_size": int(replay_size),
         "reason": reason,
         "saved_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "architecture_id": architecture_id,
         "config": _config_snapshot(cfg),
     }
     tmp = paths["meta"] + ".tmp"
@@ -224,12 +327,35 @@ def _mark_checkpoint_reason(cfg, reason):
 
 
 def _save_latest(cfg, *, run_id, iteration, generation, optimizer_steps,
-                 net, best_net, optimizer, buffer, reason):
-    """Persist a full resumable v2 snapshot to `latest.pt` (atomic) plus
-    checkpoint_meta.json (atomic)."""
+                 net, best_net, optimizer, buffer, reason, scaler=None,
+                 device=None):
+    """Persist a full resumable schema-v3 snapshot (atomic) plus
+    checkpoint_meta.json (atomic), then transactionally publish the best pair.
+
+    Publication order matters: latest.pt + checkpoint_meta.json go FIRST, and
+    best.pt + best_meta.json SECOND, both from the SAME in-memory state — so
+    the on-disk best can never run ahead of the resumable latest.pt (and is
+    never stale either).  ``best_meta.json`` carries the true accepted
+    generation.
+    """
     paths = _checkpoint_paths(cfg)
+    arch_id = getattr(net, "architecture_id", None)
     payload = {
         "schema_version": CHECKPOINT_SCHEMA_VERSION,
+        "checkpoint_format": CHECKPOINT_FORMAT_V3,
+        "architecture_id": arch_id,
+        "policy_size": int(cfg.policy_size),
+        "num_input_planes": int(cfg.num_input_planes),
+        "board_size": int(cfg.board_size),
+        "replay_capacity": int(cfg.replay_buffer_size),
+        "backend": _device_type(device if device is not None
+                                else getattr(cfg, "device", "cpu")),
+        "config_fingerprint": _config_fingerprint(cfg),
+        "scaler": scaler.state_dict() if scaler is not None else {},
+        "actor_rng": {
+            "numpy": np.random.get_state(),
+            "random": random.getstate(),
+        },
         "run_id": run_id,
         "iteration": int(iteration),
         "generation": int(generation),
@@ -249,15 +375,141 @@ def _save_latest(cfg, *, run_id, iteration, generation, optimizer_steps,
     os.replace(tmp, paths["latest"])
     _save_meta(cfg, run_id=run_id, iteration=iteration, generation=generation,
                optimizer_steps=optimizer_steps, replay_size=len(buffer),
-               reason=reason)
+               reason=reason, architecture_id=arch_id)
+    # Publish best AFTER latest so best.pt never runs ahead of resumable state.
+    _publish_best(cfg, best_net, run_id=run_id, iteration=iteration,
+                  generation=generation, architecture_id=arch_id)
     return paths["latest"]
 
 
-def _load_latest_v2(cfg):
-    """Return the latest resumable v2 snapshot, or None if it doesn't exist.
+def _validate_checkpoint_compat(cfg, payload):
+    """schema-v3 version-aware validation BEFORE any load_state_dict.
 
-    Raises IncompatibleCheckpointError for legacy/unknown schema — v1
-    checkpoints are never auto-loaded.
+    Validates architecture_id (body identity), policy/input/board tensor
+    sizes, replay capacity, backend and critical config against the config
+    that will build the training state.  Raises IncompatibleCheckpointError
+    on ANY mismatch — a v2 body is never silently loaded into a different
+    body, and a legacy/unknown schema is never labeled "v1".
+    """
+    from model import infer_state_dict_architecture_id, resolve_architecture_id
+    path = _checkpoint_paths(cfg)["latest"]
+    is_v3 = payload.get("checkpoint_format") == CHECKPOINT_FORMAT_V3
+    expected_arch = resolve_architecture_id(
+        int(getattr(cfg, "num_res_blocks", 6)),
+        int(getattr(cfg, "num_filters", 128)),
+    )
+
+    # ---- 1. architecture / body identity ----
+    payload_arch = payload.get("architecture_id")
+    if is_v3:
+        if not payload_arch:
+            raise IncompatibleCheckpointError(
+                f"checkpoint {path} is schema-v3 but carries no "
+                "architecture_id; refusing unvalidated load"
+            )
+        if payload_arch != expected_arch:
+            raise IncompatibleCheckpointError(
+                f"architecture_id mismatch: checkpoint {path} was trained "
+                f"with {payload_arch!r} but this config builds "
+                f"{expected_arch!r}. Refusing to load tensors into a "
+                "different body (schema-v3 validation)."
+            )
+    else:
+        # legacy v2 (no metadata): infer the body from the raw candidate
+        # state dict so a different body is still rejected.
+        candidate = payload.get("candidate")
+        if not isinstance(candidate, dict):
+            raise IncompatibleCheckpointError(
+                f"checkpoint {path} has no candidate state_dict; refusing "
+                "unvalidated load"
+            )
+        try:
+            inferred = infer_state_dict_architecture_id(candidate)
+        except ValueError as e:
+            raise IncompatibleCheckpointError(
+                f"checkpoint {path} candidate is not a ChessNet body: {e}"
+            ) from e
+        if inferred != expected_arch:
+            raise IncompatibleCheckpointError(
+                f"architecture mismatch: legacy checkpoint {path} body is "
+                f"{inferred!r} but this config builds {expected_arch!r}. "
+                "Refusing to load tensors into a different body."
+            )
+
+    # ---- 2. tensor-size compatibility (policy/input/board) ----
+    snap = payload.get("config") or {}
+    policy_size = payload.get("policy_size", snap.get("policy_size"))
+    num_input_planes = payload.get("num_input_planes",
+                                   snap.get("num_input_planes"))
+    board_size = payload.get("board_size", snap.get("board_size"))
+    if policy_size != getattr(cfg, "policy_size", None):
+        raise IncompatibleCheckpointError(
+            f"policy_size mismatch: checkpoint {path} has {policy_size!r}, "
+            f"config has {cfg.policy_size!r}"
+        )
+    if num_input_planes != getattr(cfg, "num_input_planes", None):
+        raise IncompatibleCheckpointError(
+            f"num_input_planes mismatch: checkpoint {path} has "
+            f"{num_input_planes!r}, config has {cfg.num_input_planes!r}"
+        )
+    if board_size != getattr(cfg, "board_size", None):
+        raise IncompatibleCheckpointError(
+            f"board_size mismatch: checkpoint {path} has {board_size!r}, "
+            f"config has {cfg.board_size!r}"
+        )
+
+    # ---- 3. replay capacity ----
+    replay_sd = payload.get("replay")
+    if not isinstance(replay_sd, dict) or "capacity" not in replay_sd:
+        raise IncompatibleCheckpointError(
+            f"checkpoint {path} has no replay state_dict; refusing "
+            "unvalidated load"
+        )
+    if int(replay_sd["capacity"]) != int(getattr(cfg, "replay_buffer_size", 0)):
+        raise IncompatibleCheckpointError(
+            f"replay capacity mismatch: checkpoint {path} replay holds "
+            f"{int(replay_sd['capacity'])} examples, config wants "
+            f"{int(getattr(cfg, 'replay_buffer_size', 0))}. A resized replay "
+            "would silently change sampling semantics."
+        )
+
+    # ---- 4. backend (CUDA-trained run never resumes silently on CPU) ----
+    payload_backend = payload.get("backend")
+    if payload_backend is None:
+        payload_backend = _device_type(snap.get("device", "cpu"))
+    cur_backend = _device_type(getattr(cfg, "device", "cpu"))
+    if payload_backend == "cuda" and cur_backend != "cuda":
+        raise IncompatibleCheckpointError(
+            f"backend mismatch: checkpoint {path} was trained on CUDA (with "
+            "AMP GradScaler state) but this process runs on CPU; refusing to "
+            "silently resume mixed-precision training on a different backend."
+        )
+
+    # ---- 5. critical config fingerprint ----
+    if is_v3:
+        fp = payload.get("config_fingerprint")
+        if fp != _config_fingerprint(cfg):
+            raise IncompatibleCheckpointError(
+                f"config fingerprint mismatch: checkpoint {path} was trained "
+                f"with a different critical config (fingerprint {fp!r} vs "
+                f"current {_config_fingerprint(cfg)!r}). Refusing resume."
+            )
+    else:
+        for k in CRITICAL_CONFIG_KEYS:
+            if k in snap and snap[k] != getattr(cfg, k, None):
+                raise IncompatibleCheckpointError(
+                    f"critical config mismatch on {k}: checkpoint {path} has "
+                    f"{snap[k]!r}, config has {getattr(cfg, k, None)!r}"
+                )
+
+
+def _load_latest_v2(cfg):
+    """Return the latest resumable snapshot, or None if it doesn't exist.
+
+    Version-aware (schema-v3): validates architecture_id / tensor sizes /
+    replay capacity / backend / critical config BEFORE any load_state_dict.
+    Raises IncompatibleCheckpointError for legacy v1 or UNKNOWN schemas —
+    an unknown future schema is never labeled "v1" and never auto-loaded.
     """
     path = _checkpoint_paths(cfg)["latest"]
     if not os.path.exists(path):
@@ -267,18 +519,31 @@ def _load_latest_v2(cfg):
     payload = torch.load(path, map_location=getattr(cfg, "device", "cpu"),
                          weights_only=False)
     version = payload.get("schema_version")
-    if version != CHECKPOINT_SCHEMA_VERSION:
+    if version is None or version == 1:
         raise IncompatibleCheckpointError(
             f"checkpoint {path} has schema_version={version!r}; expected "
-            f"{CHECKPOINT_SCHEMA_VERSION}. This looks like a v1 checkpoint — "
-            "v1 snapshots are not auto-loadable. Start fresh (or convert) and "
-            "resume only from a v2 latest.pt."
+            f"{CHECKPOINT_SCHEMA_VERSION}. This looks like a v1 snapshot — "
+            "v1 snapshots are not auto-loadable. Start fresh (or convert) "
+            "and resume only from a current latest.pt."
         )
+    if version != CHECKPOINT_SCHEMA_VERSION:
+        raise IncompatibleCheckpointError(
+            f"checkpoint {path} has schema_version={version!r}; supported "
+            f"version is {CHECKPOINT_SCHEMA_VERSION} (schema-v2 / "
+            "schema-v3 feature layer). This is an UNKNOWN future/foreign "
+            "schema, not a v1 snapshot, and will never be auto-loaded."
+        )
+    _validate_checkpoint_compat(cfg, payload)
     return payload
 
 
 def _restore_rng(state):
-    """Restore torch/cuda/random/numpy RNG states from a v2 snapshot."""
+    """Restore torch/cuda/random/numpy RNG states from a snapshot.
+
+    Schema-v3 snapshots carry an explicit ``actor_rng`` (the RNG state
+    consumed by self-play policy sampling / MCTS Dirichlet noise); legacy
+    snapshots fall back to the top-level ``random_rng``/``numpy_rng``.
+    """
     rng = state["torch_rng"]
     torch.set_rng_state(rng.cpu() if rng.is_cuda else rng)
     if state.get("cuda_rng") and torch.cuda.is_available():
@@ -289,8 +554,34 @@ def _restore_rng(state):
             torch.cuda.set_rng_state_all(
                 [r.cpu() if r.is_cuda else r for r in cuda_rng]
             )
-    random.setstate(state["random_rng"])
-    np.random.set_state(state["numpy_rng"])
+    actor = state.get("actor_rng")
+    if isinstance(actor, dict) and "random" in actor and "numpy" in actor:
+        random.setstate(actor["random"])
+        np.random.set_state(actor["numpy"])
+    else:
+        random.setstate(state["random_rng"])
+        np.random.set_state(state["numpy_rng"])
+
+
+def _reconcile_best(cfg, payload, best_net):
+    """Ensure the on-disk best pair (best.pt + best_meta.json) agrees with the
+    resumable latest.pt.  best.pt must never run ahead of (or behind) the
+    resumable best: whenever the sidecar generation/run_id disagrees with the
+    checkpoint, re-publish the pair from the checkpoint's accepted best."""
+    best_meta_path = _checkpoint_paths(cfg)["best_meta"]
+    gen = int(payload["generation"])
+    rid = payload.get("run_id")
+    if os.path.exists(best_meta_path):
+        try:
+            with open(best_meta_path) as f:
+                meta = json.load(f)
+            if meta.get("run_id") == rid and meta.get("generation") == gen:
+                return  # consistent pair, nothing to do
+        except (OSError, ValueError):
+            pass
+    _publish_best(cfg, best_net, run_id=rid,
+                  iteration=int(payload["iteration"]), generation=gen,
+                  architecture_id=payload.get("architecture_id"))
 
 
 def _archive_best(cfg):
@@ -338,12 +629,17 @@ def _new_optimizer(cfg, net):
                 weight_decay=getattr(cfg, "weight_decay", 1e-4))
 
 
-def _epoch_train(cfg, net, optimizer, buffer, device):
+def _epoch_train(cfg, net, optimizer, buffer, device, scaler=None):
     """Run `training_epochs` REAL epochs over a bounded, per-epoch-shuffled
     sample from the replay buffer.  Each minibatch is one optimizer step.
 
     Returns dict(policy_loss, value_loss, entropy, steps, batches) — losses are
     averaged over all minibatches, steps counts actual optimizer.step() calls.
+
+    `scaler` (optional GradScaler) enables mixed-precision training on CUDA:
+    the forward/loss run under autocast, the loss is scaled before backward,
+    and the optimizer steps through the scaler.  When `scaler` is None or
+    disabled (CPU / amp off) the loop is the plain FP32 path.
     """
     n = len(buffer)
     epochs = int(getattr(cfg, "training_epochs",
@@ -363,6 +659,7 @@ def _epoch_train(cfg, net, optimizer, buffer, device):
     net.train()
     sum_policy = sum_value = sum_entropy = 0.0
     steps = batches = 0
+    amp = scaler is not None and bool(getattr(scaler, "_enabled", False))
     for _ in range(epochs):
         # Uniform sample from the entire replay, freshly shuffled each epoch.
         # Sampling only permutation(sample_size) would repeatedly train the
@@ -371,15 +668,26 @@ def _epoch_train(cfg, net, optimizer, buffer, device):
         for start in range(0, sample_size, cfg.train_batch_size):
             batch_rows = rows[start:start + cfg.train_batch_size]
             states, pis, zs = buffer.sample_indices(batch_rows, device)
-            logits, value = net(states)
-            policy_loss = F.cross_entropy(logits, pis)
-            value_loss = F.mse_loss(value, zs)
-            probs = F.softmax(logits, dim=1)
+            if amp:
+                with torch.autocast(device_type=_device_type(device)):
+                    logits, value = net(states)
+                    policy_loss = F.cross_entropy(logits, pis)
+                    value_loss = F.mse_loss(value, zs)
+                    loss = policy_loss + value_loss
+                optimizer.zero_grad(set_to_none=True)
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                logits, value = net(states)
+                policy_loss = F.cross_entropy(logits, pis)
+                value_loss = F.mse_loss(value, zs)
+                loss = policy_loss + value_loss
+                optimizer.zero_grad(set_to_none=True)
+                loss.backward()
+                optimizer.step()
+            probs = F.softmax(logits.float(), dim=1)
             entropy = -(probs * (probs + 1e-12).log()).sum(dim=1).mean()
-            loss = policy_loss + value_loss
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
             sum_policy += float(policy_loss.item())
             sum_value += float(value_loss.item())
             sum_entropy += float(entropy.item())
@@ -509,6 +817,7 @@ def run(cfg=None, resume=False, on_iteration=None):
     best_net = ChessNet(cfg).to(device)
     best_net.load_state_dict(net.state_dict())
     optimizer = _new_optimizer(cfg, net)
+    scaler = _new_scaler(cfg, device)
     buffer = ReplayBuffer(
         cfg.replay_buffer_size, cfg.policy_size,
         getattr(cfg, "num_input_planes", 104),
@@ -526,6 +835,8 @@ def run(cfg=None, resume=False, on_iteration=None):
             net.load_state_dict(state["candidate"])
             best_net.load_state_dict(state["best"])
             optimizer.load_state_dict(state["optimizer"])
+            if state.get("scaler"):
+                scaler.load_state_dict(state["scaler"])
             _restore_rng(state)
             buffer.load_state_dict(state["replay"])
             run_id = state["run_id"]
@@ -560,7 +871,7 @@ def run(cfg=None, resume=False, on_iteration=None):
                 games_played += 1
 
             # ---- 2. real bounded shuffled epochs ----
-            train_out = _epoch_train(cfg, net, optimizer, buffer, device)
+            train_out = _epoch_train(cfg, net, optimizer, buffer, device, scaler)
             optimizer_steps += train_out["steps"]
 
             # ---- 3. arena gate: candidate vs incumbent best ----
@@ -589,7 +900,8 @@ def run(cfg=None, resume=False, on_iteration=None):
                          generation=generation,
                          optimizer_steps=optimizer_steps, net=net,
                          best_net=best_net, optimizer=optimizer,
-                         buffer=buffer, reason="iteration")
+                         buffer=buffer, reason="iteration",
+                         scaler=scaler, device=device)
             completed_iteration = iteration
             if iteration % int(getattr(cfg, "checkpoint_every_iterations", 1)) == 0:
                 _snapshot_checkpoint(cfg, iteration)
@@ -625,7 +937,8 @@ def run(cfg=None, resume=False, on_iteration=None):
                          generation=generation,
                          optimizer_steps=optimizer_steps, net=net,
                          best_net=best_net, optimizer=optimizer,
-                         buffer=buffer, reason="final")
+                         buffer=buffer, reason="final",
+                         scaler=scaler, device=device)
             reason = "final"
         else:
             reason = "interrupt" if interrupted else "final"
@@ -672,6 +985,7 @@ def run_parallel(cfg=None, resume=False, num_workers=None, on_iteration=None):
     search_net.load_state_dict(net.state_dict())
     search_net.eval()
     optimizer = _new_optimizer(cfg, net)
+    scaler = _new_scaler(cfg, device)
     buffer = ReplayBuffer(
         cfg.replay_buffer_size, cfg.policy_size,
         getattr(cfg, "num_input_planes", 104),
@@ -689,6 +1003,8 @@ def run_parallel(cfg=None, resume=False, num_workers=None, on_iteration=None):
             net.load_state_dict(state["candidate"])
             best_net.load_state_dict(state["best"])
             optimizer.load_state_dict(state["optimizer"])
+            if state.get("scaler"):
+                scaler.load_state_dict(state["scaler"])
             _restore_rng(state)
             buffer.load_state_dict(state["replay"])
             run_id = state["run_id"]
@@ -764,7 +1080,7 @@ def run_parallel(cfg=None, resume=False, num_workers=None, on_iteration=None):
             games_played += cfg.games_per_iteration
 
             # ---- 2. real bounded shuffled epochs ----
-            train_out = _epoch_train(cfg, net, optimizer, buffer, device)
+            train_out = _epoch_train(cfg, net, optimizer, buffer, device, scaler)
             optimizer_steps += train_out["steps"]
 
             # ---- 3. arena gate: candidate vs incumbent best ----
@@ -791,7 +1107,8 @@ def run_parallel(cfg=None, resume=False, num_workers=None, on_iteration=None):
                          generation=generation,
                          optimizer_steps=optimizer_steps, net=net,
                          best_net=best_net, optimizer=optimizer,
-                         buffer=buffer, reason="iteration")
+                         buffer=buffer, reason="iteration",
+                         scaler=scaler, device=device)
             completed_iteration = iteration
             if iteration % int(getattr(cfg, "checkpoint_every_iterations", 1)) == 0:
                 _snapshot_checkpoint(cfg, iteration)
@@ -836,7 +1153,8 @@ def run_parallel(cfg=None, resume=False, num_workers=None, on_iteration=None):
                          generation=generation,
                          optimizer_steps=optimizer_steps, net=net,
                          best_net=best_net, optimizer=optimizer,
-                         buffer=buffer, reason="final")
+                         buffer=buffer, reason="final",
+                         scaler=scaler, device=device)
             reason = "final"
         else:
             reason = "interrupt" if interrupted else "final"

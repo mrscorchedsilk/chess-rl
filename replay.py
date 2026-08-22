@@ -26,6 +26,7 @@ memory stays ~10x smaller.
 """
 
 from collections import deque
+import threading
 
 import numpy as np
 import torch
@@ -226,3 +227,168 @@ class ReplayBuffer:
             self._legal.append(legal[a:b])
             self._probs.append(probs[a:b])
             self._zs.append(float(zs[i]))
+
+
+# --------------------------------------------------------------------------- #
+#  Pinned minibatch staging (Task 8)                                          #
+# --------------------------------------------------------------------------- #
+# The replay buffer stays COMPRESSED in RAM.  PinnedReplayLoader stages dense
+# minibatches into reusable page-locked host buffers with one async prefetcher
+# thread, so the expensive decompression of the NEXT minibatch overlaps the
+# optimizer step of the CURRENT one, and the H2D transfer is a non-blocking
+# copy.  Row selection is always the CALLER's job (np.random.choice in
+# train._epoch_train), so the loader never perturbs the training RNG sequence
+# and resume determinism is preserved.
+
+class PinnedReplayLoader:
+    """Stage dense minibatches from a ReplayBuffer with pinned buffers +
+    async prefetch of the next minibatch (replay stays in RAM, not VRAM).
+
+    ``batches(rows)`` yields ``(states, pis, zs)`` on ``device`` for
+    consecutive ``batch_size`` slices of ``rows``.  On CUDA a background
+    thread decompresses slice i+1 into a reusable pinned CPU buffer and
+    issues a non-blocking H2D copy while the caller trains on slice i; a
+    CUDA event guarantees a buffer is never overwritten before its previous
+    copy completed.  On CPU (or without CUDA) it is a synchronous passthrough
+    identical to ``buffer.sample_indices(rows, device)``.
+
+    The pinned buffers are allocated lazily and REUSED across ``batches()``
+    calls (bounded pool of ``max(2, num_prefetch + 1)`` sets), so a long
+    training run does not allocate per-minibatch host memory.
+    """
+
+    def __init__(self, buffer, batch_size, device, num_prefetch=1):
+        self.buffer = buffer
+        self.batch_size = int(batch_size)
+        self.device = device
+        self.num_prefetch = max(1, int(num_prefetch))
+        device_type = str(device).split(":")[0]
+        self._async = bool(device_type == "cuda" and torch.cuda.is_available())
+        self._num_buffers = max(2, self.num_prefetch + 1)
+        self._pin_sets = []          # reusable (states, pis, zs) pinned tensors
+        self._pin_events = []        # last CUDA event per pin set (copy-done)
+        self._free = list(range(self._num_buffers))  # pin sets ready to refill
+        self._ready = deque()        # (states, pis, zs) device tensors
+        self._lock = threading.Lock()
+        self._cond = threading.Condition(self._lock)
+        self._stop = False
+        self._worker_error = None
+        self._thread = None
+        self._prefetch_calls = 0
+        self._batch_count = 0
+
+    # ---- diagnostics (used by tests + benchmarks) ----
+
+    @property
+    def pin_sets_allocated(self):
+        """Number of pinned buffer sets actually allocated (<= _num_buffers)."""
+        return len(self._pin_sets)
+
+    @property
+    def num_buffers(self):
+        return self._num_buffers
+
+    @property
+    def prefetch_calls(self):
+        return self._prefetch_calls
+
+    @property
+    def batch_count(self):
+        return self._batch_count
+
+    # ---- public iteration ----
+
+    def batches(self, rows):
+        """Yield (states, pis, zs) on self.device for slices of ``rows``,
+        prefetching the next slice on a background thread (CUDA only)."""
+        rows = np.asarray(rows, dtype=np.int64).reshape(-1)
+        n = rows.shape[0]
+        if n == 0:
+            return
+        slices = [rows[s:s + self.batch_size]
+                  for s in range(0, n, self.batch_size)]
+        if not self._async:
+            for rb in slices:
+                self._batch_count += 1
+                yield self.buffer.sample_indices(rb, self.device)
+            return
+        self._start_worker(slices)
+        try:
+            for _ in range(len(slices)):
+                with self._cond:
+                    while not self._ready and not self._stop:
+                        self._cond.wait()
+                    if not self._ready:
+                        break
+                    dev = self._ready.popleft()
+                self._batch_count += 1
+                yield dev
+        finally:
+            self._stop_worker()
+        if self._worker_error is not None:
+            raise self._worker_error
+
+    # ---- async machinery ----
+
+    def _start_worker(self, slices):
+        self._stop = False
+        self._worker_error = None
+        self._thread = threading.Thread(
+            target=self._worker, args=(slices,), daemon=True
+        )
+        self._thread.start()
+
+    def _stop_worker(self):
+        with self._cond:
+            self._stop = True
+            self._cond.notify_all()
+        if self._thread is not None:
+            self._thread.join(timeout=5.0)
+            self._thread = None
+
+    def _worker(self, slices):
+        try:
+            for rb in slices:
+                with self._cond:
+                    while len(self._ready) >= self.num_prefetch and not self._stop:
+                        self._cond.wait()
+                    if self._stop:
+                        break
+                    buf_idx = self._free.pop(0)
+                states, pis, zs = self.buffer.sample_indices(rb, "cpu")
+                pins = self._stage(buf_idx, states, pis, zs)
+                dev_states = pins[0].to(self.device, non_blocking=True)
+                dev_pis = pins[1].to(self.device, non_blocking=True)
+                dev_zs = pins[2].to(self.device, non_blocking=True)
+                ev = torch.cuda.Event()
+                ev.record()
+                with self._cond:
+                    self._ready.append((dev_states, dev_pis, dev_zs))
+                    self._free.append(buf_idx)
+                    self._pin_events[buf_idx] = ev
+                    self._prefetch_calls += 1
+                    self._cond.notify_all()
+        except Exception as e:  # noqa: BLE001 - surfaced to the consumer
+            with self._cond:
+                self._worker_error = e
+                self._stop = True
+                self._cond.notify_all()
+
+    def _stage(self, buf_idx, states, pis, zs):
+        """Copy into the reusable pinned buffer set ``buf_idx``; wait for its
+        previous H2D copy (CUDA event) so it is safe to overwrite."""
+        if buf_idx >= len(self._pin_sets):
+            self._pin_sets.append((
+                torch.empty_like(states, pin_memory=True),
+                torch.empty_like(pis, pin_memory=True),
+                torch.empty_like(zs, pin_memory=True),
+            ))
+            self._pin_events.append(None)
+        prev = self._pin_events[buf_idx]
+        if prev is not None:
+            prev.synchronize()   # previous copy from this buffer has finished
+        states_p, pis_p, zs_p = self._pin_sets[buf_idx]
+        states_p.copy_(states, non_blocking=False)  # host -> pinned host
+        pis_p.copy_(pis, non_blocking=False)
+        zs_p.copy_(zs, non_blocking=False)
+        return states_p, pis_p, zs_p

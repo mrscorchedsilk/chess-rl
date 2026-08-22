@@ -18,6 +18,22 @@ def get_device():
     return "cuda" if torch.cuda.is_available() else "cpu"
 
 
+# --------------------------------------------------------------------------- #
+#  Architecture registry (Task 9)                                             #
+# --------------------------------------------------------------------------- #
+# Canonical body identities: (num_res_blocks, num_filters).  Checkpoints carry
+# an ``architecture_id`` so tensors can NEVER be loaded into a different body.
+# The v2 body keeps its legacy id; the v3 candidates are selectable but the
+# DEFAULT stays v2-6x128 until benchmarks pick a winner (the final 10x192
+# default switch is a later step, not this one).
+ARCHITECTURES = {
+    "v2-6x128": (6, 128),      # current default; 2,170,218 params
+    "v3-10x128": (10, 128),    # 3,352,938 params
+    "v3-10x192": (10, 192),    # 7,241,194 params
+    "v3-10x256": (10, 256),    # 12,604,010 params
+}
+
+
 class Config:
     # ---- model (ResNet encoder + spatial policy/value heads) ----
     board_size = 8
@@ -25,6 +41,15 @@ class Config:
     num_input_planes = 12 * history_steps + 8   # 104: 8 history x 12 piece planes + 8 meta
     num_res_blocks = 6                # AlphaZero used 20; 6 keeps training fast/observable
     num_filters = 128                 # AlphaZero used 256
+    # Task 9: body identity.  Default is v2-6x128 (unchanged).  Selectable:
+    #   v3-10x128 / v3-10x192 / v3-10x256.  Explicit num_res_blocks/num_filters
+    # overrides (as used by the test suite) still win over this label; the
+    # model derives a canonical id from the actual body in that case.
+    architecture_id = "v2-6x128"
+    # v3-only: drop the redundant conv biases (conv+BN makes them redundant).
+    # Gated behind an explicit v3 architecture id — v2 bodies are NEVER
+    # silently mutated.
+    remove_conv_bias = False
     policy_planes = 73                # 56 queen-like (8 dirs x 7 dist) + 8 knight + 9 underpromo
     policy_size = policy_planes * 64  # 4672: flat index = from_square * 73 + plane
 
@@ -47,6 +72,7 @@ class Config:
     games_per_iteration = 20
     replay_buffer_size = 50_000
     num_iterations = 200
+    amp = True                   # mixed precision (autocast + GradScaler) on CUDA
 
     # ---- arena acceptance gating (new net vs current best) ----
     arena_every = 10
