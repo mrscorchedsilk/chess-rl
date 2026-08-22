@@ -11,6 +11,8 @@ add_library(chess_rl_native_core STATIC
 )
 target_compile_features(chess_rl_native_core PUBLIC cxx_std_17)
 set_target_properties(chess_rl_native_core PROPERTIES
+  CXX_STANDARD 17
+  CXX_STANDARD_REQUIRED ON
   CXX_EXTENSIONS OFF
   POSITION_INDEPENDENT_CODE ON
 )
@@ -21,6 +23,11 @@ target_include_directories(chess_rl_native_core PUBLIC
 
 add_executable(native_perft_test native/tests/native_perft_test.cpp)
 target_compile_features(native_perft_test PRIVATE cxx_std_17)
+set_target_properties(native_perft_test PROPERTIES
+  CXX_STANDARD 17
+  CXX_STANDARD_REQUIRED ON
+  CXX_EXTENSIONS OFF
+)
 target_link_libraries(native_perft_test PRIVATE chess_rl_native_core)
 add_test(NAME native_perft_test COMMAND native_perft_test)
 
