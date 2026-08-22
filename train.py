@@ -66,6 +66,7 @@ from selfplay import play_game
 from arena import play_match
 from parallel import InferenceServer, worker_loop
 from replay import ReplayBuffer, PinnedReplayLoader
+import native_selfplay
 
 Adam = torch.optim.Adam  # module alias so tests can substitute a spy
 
@@ -1168,6 +1169,173 @@ def run_parallel(cfg=None, resume=False, num_workers=None, on_iteration=None):
         print("Training complete.", flush=True)
 
 
+# --------------------------------------------------------------------------- #
+#  native self-play loop                                                       #
+# --------------------------------------------------------------------------- #
+
+def run_native(cfg=None, resume=False, on_iteration=None):
+    """Self-play / train / arena loop with the native C++ actor + GPU runtime.
+
+    Replaces the Python worker-process self-play (`run_parallel`) with one
+    native `Actor` managing `games_per_iteration` concurrent games, feeding the
+    GPU through the persistent `InferenceRuntime` (sparse legal-logit gather,
+    FP16, pinned buffers).  Training, arena gating, checkpointing and resume
+    semantics are identical to the serial `run()`.
+    """
+    if cfg is None:
+        cfg = Config()
+
+    _seed_all(cfg.seed)
+    os.makedirs(cfg.checkpoint_dir, exist_ok=True)
+    device = getattr(cfg, "device", "cpu")
+
+    net = ChessNet(cfg).to(device)
+    best_net = ChessNet(cfg).to(device)
+    best_net.load_state_dict(net.state_dict())
+    optimizer = _new_optimizer(cfg, net)
+    scaler = _new_scaler(cfg, device)
+    buffer = ReplayBuffer(
+        cfg.replay_buffer_size, cfg.policy_size,
+        getattr(cfg, "num_input_planes", 104),
+        getattr(cfg, "board_size", 8),
+    )
+
+    start_iteration = 1
+    generation = 0
+    optimizer_steps = 0
+    run_id = _make_run_id(cfg)
+
+    if resume:
+        state = _load_latest_v2(cfg)
+        if state is not None:
+            net.load_state_dict(state["candidate"])
+            best_net.load_state_dict(state["best"])
+            optimizer.load_state_dict(state["optimizer"])
+            if state.get("scaler"):
+                scaler.load_state_dict(state["scaler"])
+            _restore_rng(state)
+            buffer.load_state_dict(state["replay"])
+            run_id = state["run_id"]
+            generation = int(state["generation"])
+            optimizer_steps = int(state["optimizer_steps"])
+            start_iteration = int(state["iteration"]) + 1
+            print(
+                f"Resumed run {run_id} (next iter {start_iteration}, "
+                f"generation {generation}, steps {optimizer_steps})",
+                flush=True,
+            )
+
+    best_path = _checkpoint_paths(cfg)["best"]
+    if not resume:
+        _archive_best(cfg)
+        _archive_latest(cfg)
+    _save_best_atomic(cfg, best_net)
+
+    # The GPU inference runtime holds a resident model.  It owns its own copy
+    # (never the trainer's best_net, which the arena and checkpointer mutate
+    # and read); weights are refreshed from best_net before each self-play
+    # round so the actor always plays the accepted incumbent.
+    inference_fn = native_selfplay.make_gpu_inference_fn(cfg)
+
+    games_played = (start_iteration - 1) * cfg.games_per_iteration
+    num_iterations = int(getattr(cfg, "num_iterations", 1))
+    iteration = start_iteration - 1
+    completed_iteration = start_iteration - 1
+    interrupted = False
+
+    try:
+        for iteration in range(start_iteration, num_iterations + 1):
+            # ---- 1. self-play with the ACCEPTED best as teacher ----
+            net.eval()
+            best_net.eval()
+            inference_fn.update_weights(best_net.state_dict())
+            sp = native_selfplay.NativeSelfPlay(
+                cfg,
+                inference_fn,
+                games=cfg.games_per_iteration,
+                weight_version=optimizer_steps,  # monotonically increases
+                generation=generation,
+            )
+            buffer.extend(sp.run())
+            games_played += cfg.games_per_iteration
+
+            # ---- 2. real bounded shuffled epochs ----
+            train_out = _epoch_train(cfg, net, optimizer, buffer, device, scaler)
+            optimizer_steps += train_out["steps"]
+
+            # ---- 3. arena gate: candidate vs incumbent best ----
+            if iteration % int(getattr(cfg, "arena_every", 10)) == 0:
+                outcome = _arena_gate(cfg, net, best_net)
+                if outcome["accepted"]:
+                    generation += 1
+                    best_net.load_state_dict(net.state_dict())
+                    best_net.eval()
+                    _save_best_atomic(cfg, best_net)
+                else:
+                    net.load_state_dict(best_net.state_dict())
+                    optimizer = _new_optimizer(cfg, net)
+                    optimizer_steps = 0
+                _log_arena_event(
+                    cfg, run_id=run_id, iteration=iteration,
+                    generation=generation, wins=outcome["a"],
+                    draws=outcome["draws"], losses=outcome["b"],
+                    score=outcome["score"], accepted=outcome["accepted"],
+                )
+
+            # ---- 4. durable checkpoint after EVERY completed iteration ----
+            _save_latest(cfg, run_id=run_id, iteration=iteration,
+                         generation=generation,
+                         optimizer_steps=optimizer_steps, net=net,
+                         best_net=best_net, optimizer=optimizer,
+                         buffer=buffer, reason="iteration",
+                         scaler=scaler, device=device)
+            completed_iteration = iteration
+            if iteration % int(getattr(cfg, "checkpoint_every_iterations", 1)) == 0:
+                _snapshot_checkpoint(cfg, iteration)
+
+            _log_metrics(cfg, run_id=run_id, iteration=iteration,
+                         generation=generation,
+                         policy_loss=train_out["policy_loss"],
+                         value_loss=train_out["value_loss"],
+                         entropy=train_out["entropy"],
+                         optimizer_steps=optimizer_steps,
+                         replay_size=len(buffer), games=games_played)
+            print(
+                f"iter {iteration:4d}  gen {generation}  steps {optimizer_steps}"
+                f"  buffer {len(buffer)}  "
+                f"p {train_out['policy_loss']:.4f} v {train_out['value_loss']:.4f}",
+                flush=True,
+            )
+            if on_iteration is not None:
+                on_iteration(iteration)
+    except BaseException:
+        interrupted = True
+        raise
+    finally:
+        if interrupted:
+            if completed_iteration >= start_iteration:
+                _mark_checkpoint_reason(cfg, "interrupt")
+            reason = "interrupt"
+        elif completed_iteration >= start_iteration:
+            _save_latest(cfg, run_id=run_id, iteration=completed_iteration,
+                         generation=generation,
+                         optimizer_steps=optimizer_steps, net=net,
+                         best_net=best_net, optimizer=optimizer,
+                         buffer=buffer, reason="final",
+                         scaler=scaler, device=device)
+            reason = "final"
+        else:
+            reason = "interrupt" if interrupted else "final"
+        print(
+            f"{'Training interrupted' if interrupted else 'Training complete.'} "
+            f"(saved iteration {completed_iteration}, reason={reason})",
+            flush=True,
+        )
+    _save_best_atomic(cfg, best_net)
+    if not interrupted:
+        print("Training complete.", flush=True)
+
+
 if __name__ == "__main__":
     import argparse
 
@@ -1183,8 +1351,16 @@ if __name__ == "__main__":
         default=0,
         help="Parallel self-play worker processes (0 = serial loop; >=2 = process pool)",
     )
+    p.add_argument(
+        "--selfplay-backend",
+        choices=("python", "native"),
+        default="python",
+        help="Self-play engine: python (worker processes) or native (C++ actor + GPU runtime)",
+    )
     args = p.parse_args()
-    if args.workers >= 2:
+    if args.selfplay_backend == "native":
+        run_native(resume=args.resume)
+    elif args.workers >= 2:
         run_parallel(resume=args.resume, num_workers=args.workers)
     else:
         run(resume=args.resume)
