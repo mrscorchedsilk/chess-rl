@@ -1,11 +1,14 @@
 """Unit tests for the machine-readable gate runner (scripts/gate_runner.py).
 
 Strict TDD: these tests were written first (RED) and only exercise harmless
-fake commands -- never the real heavy gates, never training. The CLI's gate
-selection and registry override make this possible.
+fake commands -- never the real heavy gates, never training. The in-process
+registry hook lets tests use harmless commands without exposing arbitrary
+registry execution through the public CLI.
 """
+import hashlib
 import json
 import os
+from pathlib import Path
 import subprocess
 import sys
 
@@ -316,6 +319,19 @@ class TestEvidence:
         err = (run_dir / "talky.stderr.txt").read_text()
         assert out == "OUT-LINE\n"
         assert err == "ERR-LINE\n"
+
+    def test_evidence_entries_include_hashes_and_byte_counts(self, tmp_path):
+        code = "print('evidence')"
+        reg = {"hashed": gr.GateSpec(
+            id="hashed", cmd=("{python}", "-c", code), cwd="repo", required=True)}
+        runner = make_runner(tmp_path, registry=reg, selected=["hashed"])
+        summary = runner.run()
+        entry = summary["gates"][0]
+        run_dir = Path(summary["evidence_dir"])
+        for stream in ("stdout", "stderr"):
+            payload = (run_dir / entry[f"{stream}_file"]).read_bytes()
+            assert entry[f"{stream}_bytes"] == len(payload)
+            assert entry[f"{stream}_sha256"] == hashlib.sha256(payload).hexdigest()
 
     def test_command_and_cwd_recorded_in_entry(self, tmp_path):
         runner = make_runner(tmp_path, selected=["fake_pass"])

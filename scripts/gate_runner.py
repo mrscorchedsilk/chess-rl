@@ -79,6 +79,7 @@ Placeholders in trusted in-process test registries: ``{python}``, ``{repo}``,
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import os
@@ -634,7 +635,11 @@ class GateRunner:
                     "timed_out": False,
                     "duration_s": None,
                     "stdout_file": None,
+                    "stdout_bytes": None,
+                    "stdout_sha256": None,
                     "stderr_file": None,
+                    "stderr_bytes": None,
+                    "stderr_sha256": None,
                 })
                 continue
 
@@ -650,8 +655,10 @@ class GateRunner:
 
             out_name = f"{gid}.stdout.txt"
             err_name = f"{gid}.stderr.txt"
-            (self.evidence_dir / out_name).write_text(result["stdout"])
-            (self.evidence_dir / err_name).write_text(result["stderr"])
+            out_payload = result["stdout"].encode("utf-8")
+            err_payload = result["stderr"].encode("utf-8")
+            (self.evidence_dir / out_name).write_bytes(out_payload)
+            (self.evidence_dir / err_name).write_bytes(err_payload)
 
             entries.append({
                 "id": gid,
@@ -666,7 +673,11 @@ class GateRunner:
                 "timed_out": result["timed_out"],
                 "duration_s": result["duration_s"],
                 "stdout_file": out_name,
+                "stdout_bytes": len(out_payload),
+                "stdout_sha256": hashlib.sha256(out_payload).hexdigest(),
                 "stderr_file": err_name,
+                "stderr_bytes": len(err_payload),
+                "stderr_sha256": hashlib.sha256(err_payload).hexdigest(),
             })
 
         required_failed = sum(
