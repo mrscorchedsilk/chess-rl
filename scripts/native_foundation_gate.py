@@ -109,6 +109,11 @@ assert n.build_info()['cplusplus'] == 201703
 assert 'MIT License' in (Path(n.__file__).resolve().parent / 'LICENSE').read_text()
 assert n.perft({START_FEN!r}, 5) == 4865609
 assert n.perft({KIWIPETE_FEN!r}, 5) == 193690690
+cycle = ['g1f3', 'g8f6', 'f3g1', 'f6g8'] * 2
+position = n.Position.from_uci_history({START_FEN!r}, cycle)
+assert position.is_repetition(3)
+assert position.outcome(claim_draw=False) is None
+assert position.outcome(claim_draw=True) == {{'winner': None, 'termination': 'threefold_repetition'}}
 print('clean-wheel native foundation: PASS')
 """
         commands.append(run([clean_python, "-c", smoke], cwd=repo, timeout=300))
