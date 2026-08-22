@@ -10,6 +10,10 @@ perft = _native.perft
 # Native MCTS core (Task 5): batched PUCT search, semantics-matched to mcts.py.
 MCTS = _native.MCTS
 
+# Native multi-game self-play Actor (Task 6): per-game MCTS cores, merged
+# gather_leaves batches, temperature-sampled moves, z-labelled examples.
+Actor = _native.Actor
+
 # Policy / action-map constants (AlphaZero 73-plane policy).
 POLICY_PLANES = _native.POLICY_PLANES
 POLICY_SIZE = _native.POLICY_SIZE
@@ -47,6 +51,7 @@ __all__ = [
     "Position",
     "perft",
     "MCTS",
+    "Actor",
     "POLICY_PLANES",
     "POLICY_SIZE",
     "QUEEN_PLANES",

@@ -7,6 +7,7 @@
 #include <stdexcept>
 #include <string>
 
+#include "actor.h"
 #include "chess.hpp"
 #include "mcts.h"
 #include "policy.h"
@@ -133,6 +134,81 @@ void mcts_apply_evaluations(
     self.apply_evaluations(tokens, offsets, logits, values);
 }
 
+// ---------------------------------------------------------------------------
+// Actor (Task 6): multi-game self-play via per-game native MCTS cores
+// ---------------------------------------------------------------------------
+
+// gather_leaves -> (tokens, inputs, legal_offsets, legal_indices), with the
+// same tensor shapes as MCTS.gather_leaves but the leaves merged across every
+// in-play game into one batch. tokens = [0, 1, 2, ...] flat indices into the
+// merged pending list.
+py::tuple actor_gather_leaves(Actor& self, int max_batch) {
+    const Actor::GatherResult result = self.gather_leaves(max_batch);
+    const int B = static_cast<int>(result.leaves.size());
+
+    std::vector<int> tokens(static_cast<std::size_t>(B));
+    for (int i = 0; i < B; ++i) tokens[static_cast<std::size_t>(i)] = i;
+
+    py::array_t<float> inputs({B, 104, 8, 8});
+    float* in_ptr = inputs.mutable_data();
+    for (int i = 0; i < B; ++i) {
+        const auto& planes = result.leaves[static_cast<std::size_t>(i)].planes;
+        std::copy(planes.begin(), planes.end(),
+                  in_ptr + static_cast<std::size_t>(i) * (104 * 64));
+    }
+
+    py::array_t<std::int32_t> offsets(result.legal_offsets.size());
+    std::copy(result.legal_offsets.begin(), result.legal_offsets.end(),
+              offsets.mutable_data());
+
+    py::array_t<std::int32_t> indices(result.legal_indices.size());
+    std::copy(result.legal_indices.begin(), result.legal_indices.end(),
+              indices.mutable_data());
+
+    return py::make_tuple(tokens, inputs, offsets, indices);
+}
+
+void actor_apply_evaluations(
+    Actor& self, const std::vector<int>& tokens,
+    const py::array_t<std::int32_t, py::array::c_style | py::array::forcecast>&
+        offsets_arr,
+    const py::array_t<float, py::array::c_style | py::array::forcecast>&
+        logits_arr,
+    const py::array_t<float, py::array::c_style | py::array::forcecast>&
+        values_arr) {
+    const std::vector<std::int32_t> offsets(offsets_arr.data(),
+                                            offsets_arr.data() + offsets_arr.size());
+    const std::vector<float> logits(logits_arr.data(),
+                                    logits_arr.data() + logits_arr.size());
+    const std::vector<float> values(values_arr.data(),
+                                    values_arr.data() + values_arr.size());
+    self.apply_evaluations(tokens, offsets, logits, values);
+}
+
+// finished_games() -> list of dicts:
+//   {"generation": int, "weight_version": int, "termination": str,
+//    "examples": [(state[104,8,8] f32, pi[4672] f32, z float), ...]}
+py::list actor_finished_games(Actor& self) {
+    py::list out;
+    for (Game& game : self.finished_games()) {
+        py::dict record;
+        record["generation"] = game.teacher_generation;
+        record["weight_version"] = game.teacher_weight_version;
+        record["termination"] = game.result_termination;
+        py::list examples;
+        for (const Example& ex : game.examples) {
+            py::array_t<float> state({104, 8, 8});
+            std::copy(ex.state.begin(), ex.state.end(), state.mutable_data());
+            py::array_t<float> pi(POLICY_SIZE);
+            std::copy(ex.pi.begin(), ex.pi.end(), pi.mutable_data());
+            examples.append(py::make_tuple(state, pi, ex.z));
+        }
+        record["examples"] = examples;
+        out.append(record);
+    }
+    return out;
+}
+
 }  // namespace
 }  // namespace chess_rl_native
 
@@ -200,4 +276,26 @@ PYBIND11_MODULE(_chess_rl_native, module) {
         .def("is_complete", &MCTS::is_complete)
         .def("policy", &MCTS::policy, py::arg("temperature") = 0.0)
         .def("root_visit_counts", &MCTS::root_visit_counts);
+
+    // Actor (Task 6): native multi-game self-play. Each game owns its own
+    // MCTS core and Position; gather_leaves merges leaves across games and
+    // apply_evaluations routes the network output back per game.
+    py::class_<Actor>(module, "Actor")
+        .def(py::init<int, double, double, int, double, int, int,
+                      std::uint64_t>(),
+             py::arg("games"), py::arg("c_puct") = 1.25,
+             py::arg("virtual_loss") = 3.0,
+             py::arg("num_simulations") = 100, py::arg("temperature") = 1.0,
+             py::arg("temperature_threshold") = 30,
+             py::arg("max_game_length") = 400, py::arg("seed") = 42)
+        .def("set_teacher", &Actor::set_teacher, py::arg("weight_version"),
+             py::arg("generation"))
+        .def("gather_leaves", &actor_gather_leaves, py::arg("max_batch"))
+        .def("apply_evaluations", &actor_apply_evaluations, py::arg("tokens"),
+             py::arg("legal_offsets"), py::arg("legal_logits"),
+             py::arg("values"))
+        .def("advance", &Actor::advance)
+        .def("finished_games", &actor_finished_games)
+        .def("is_done", &Actor::is_done)
+        .def("games_remaining", &Actor::games_remaining);
 }

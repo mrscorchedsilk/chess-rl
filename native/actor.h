@@ -1,0 +1,135 @@
+#pragma once
+
+#include <cstdint>
+#include <optional>
+#include <random>
+#include <string>
+#include <utility>
+#include <vector>
+
+#include "mcts.h"
+#include "policy.h"
+#include "position.h"
+
+namespace chess_rl_native {
+
+// One training example captured at a single ply of a self-play game.
+struct Example {
+    std::vector<float> state;  // 104 * 64 encoded planes (history_steps = 8)
+    std::vector<float> pi;     // 4672-length AlphaZero policy vector
+    std::string side;          // side to move at this ply ("w" / "b")
+    float z = 0.0f;            // outcome from `side`'s perspective, filled at
+                               // game end: 1.0 win, -1.0 loss, 0.0 draw
+};
+
+// A completed self-play game: ordered examples plus the teacher handle that
+// produced it.
+struct Game {
+    std::vector<Example> examples;
+    int teacher_generation = -1;
+    int teacher_weight_version = -1;
+    std::string result_termination;
+};
+
+// Native multi-game self-play actor (AlphaZero style, mirroring selfplay.py):
+//
+//  - owns `games` concurrent games, each with its OWN MCTS and its OWN
+//    Position (standard start position, empty history),
+//  - gather_leaves merges every in-play game's pending MCTS leaves into ONE
+//    batch; apply_evaluations routes each leaf's network output back to the
+//    owning game's MCTS,
+//  - advance() converts completed searches into moves (temperature-sampled
+//    with a per-game RNG), records (state, pi, side) examples, and finalises
+//    finished games with z-values computed exactly like selfplay.py
+//    (white_result 1.0 / -1.0 / 0.0; z = white_result for White-to-move,
+//    -white_result for Black-to-move).
+class Actor {
+  public:
+    Actor(int games, double c_puct, double virtual_loss, int num_simulations,
+          double temperature, int temperature_threshold, int max_game_length,
+          std::uint64_t seed);
+
+    // Records the immutable (weight_version, generation) teacher handle that
+    // produced every completed game. No weights are loaded here; the network
+    // is injected externally via gather_leaves / apply_evaluations.
+    void set_teacher(int weight_version, int generation);
+
+    struct GatherResult {
+        // Merged pending leaves across all in-play games, in game order.
+        std::vector<MCTS::PendingLeaf> leaves;
+        // CSR over leaves: legal_offsets[i]..legal_offsets[i+1] indexes
+        // legal_indices for leaf i; legal_offsets has leaves.size() + 1
+        // entries and always starts with 0 (even when leaves is empty).
+        std::vector<std::int32_t> legal_offsets;
+        std::vector<std::int32_t> legal_indices;
+    };
+
+    // Runs up to `max_batch` MCTS simulations per in-play game (each game's
+    // MCTS bounds its own remaining simulation budget) and concatenates the
+    // leaves into one merged batch. tokens = [0, 1, 2, ...] flat indices into
+    // the merged pending list; per-leaf game ownership is tracked internally
+    // for apply_evaluations routing. Returns empty once every in-play game's
+    // search is complete.
+    [[nodiscard]] GatherResult gather_leaves(int max_batch);
+
+    // Routes each token's row of legal_logits/values back to the owning
+    // game's MCTS.apply_evaluations. Array sizes are validated first;
+    // anything inconsistent throws std::invalid_argument before any game's
+    // search state changes.
+    void apply_evaluations(const std::vector<int>& tokens,
+                           const std::vector<std::int32_t>& legal_offsets,
+                           const std::vector<float>& legal_logits,
+                           const std::vector<float>& values);
+
+    // For every game whose MCTS search is complete: sample a move
+    // (temperature if ply < temperature_threshold, else 0.0, via the game's
+    // own std::mt19937), record a training example, push the move, and either
+    // finalise the game (terminal position or ply >= max_game_length) or
+    // start a fresh search on the new position.
+    void advance();
+
+    // Pops and returns all games finished since the last call.
+    [[nodiscard]] std::vector<Game> finished_games();
+
+    [[nodiscard]] bool is_done() const;
+    [[nodiscard]] int games_remaining() const;
+
+  private:
+    struct GameState {
+        std::optional<Position> pos;  // parked at the current root
+        MCTS mcts;
+        std::vector<Example> examples;
+        bool finished = false;
+        std::mt19937 rng;  // move sampling, seeded deterministically
+
+        GameState(double c_puct, double virtual_loss, int num_simulations,
+                  double dirichlet_alpha, double dirichlet_epsilon,
+                  std::uint64_t seed);
+    };
+
+    static std::string sample_move(
+        const std::vector<std::pair<std::string, double>>& policy,
+        double temperature, std::mt19937& rng);
+
+    // Finalises `game`: fills z-values from `white_result`, stamps the
+    // teacher handle, and moves it to the finished queue.
+    void finalise(GameState& game, float white_result,
+                  std::string termination);
+
+    double temperature_;
+    int temperature_threshold_;
+    int max_game_length_;
+    int teacher_generation_ = -1;
+    int teacher_weight_version_ = -1;
+
+    std::vector<GameState> games_;
+    std::vector<Game> finished_;
+
+    // Ownership map of the last merged gather (consumed by the next
+    // apply_evaluations): leaf_game_[i] = game owning merged leaf i, and
+    // game_base_[g]..game_base_[g+1] is game g's contiguous leaf block.
+    std::vector<int> leaf_game_;
+    std::vector<int> game_base_;
+};
+
+}  // namespace chess_rl_native

@@ -7,6 +7,7 @@ find_package(pybind11 CONFIG REQUIRED)
 enable_testing()
 
 add_library(chess_rl_native_core STATIC
+  native/actor.cpp
   native/position.cpp
   native/policy.cpp
   native/node_pool.cpp
