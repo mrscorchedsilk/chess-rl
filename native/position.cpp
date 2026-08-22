@@ -110,6 +110,64 @@ std::string move_uci(const chess::Board& board, const chess::Move& move) {
     return result;
 }
 
+chess::Movelist legal_moves(const chess::Board& board) {
+    chess::Movelist moves;
+    chess::movegen::legalmoves(moves, board);
+    return moves;
+}
+
+bool has_legal_en_passant(const chess::Movelist& moves) {
+    return std::any_of(moves.begin(), moves.end(), [](const chess::Move& move) {
+        return move.typeOf() == chess::Move::ENPASSANT;
+    });
+}
+
+std::string transposition_key(const chess::Board& board) {
+    const auto moves = legal_moves(board);
+    std::istringstream input(board.getFen(false));
+    std::string placement;
+    std::string active_color;
+    std::string castling;
+    std::string ep;
+    if (!(input >> placement >> active_color >> castling >> ep)) {
+        throw std::logic_error("chess library returned malformed FEN");
+    }
+    if (!has_legal_en_passant(moves)) ep = "-";
+    return placement + " " + active_color + " " + castling + " " + ep;
+}
+
+bool has_insufficient_material(const chess::Board& board, chess::Color color) {
+    const auto pawns = board.pieces(chess::PieceType::PAWN);
+    const auto knights = board.pieces(chess::PieceType::KNIGHT);
+    const auto bishops = board.pieces(chess::PieceType::BISHOP);
+    const auto rooks = board.pieces(chess::PieceType::ROOK);
+    const auto queens = board.pieces(chess::PieceType::QUEEN);
+    const auto kings = board.pieces(chess::PieceType::KING);
+
+    if (static_cast<bool>(board.us(color) & (pawns | rooks | queens))) return false;
+
+    if (static_cast<bool>(board.pieces(chess::PieceType::KNIGHT, color))) {
+        return board.us(color).count() <= 2 &&
+               !static_cast<bool>(board.us(~color) & ~(kings | queens));
+    }
+
+    if (static_cast<bool>(board.pieces(chess::PieceType::BISHOP, color))) {
+        auto remaining_bishops = bishops;
+        const int square_color = (9 * remaining_bishops.pop()) & 8;
+        while (remaining_bishops) {
+            if (((9 * remaining_bishops.pop()) & 8) != square_color) return false;
+        }
+        return !static_cast<bool>(pawns) && !static_cast<bool>(knights);
+    }
+
+    return true;
+}
+
+bool is_insufficient_material(const chess::Board& board) {
+    return has_insufficient_material(board, chess::Color::WHITE) &&
+           has_insufficient_material(board, chess::Color::BLACK);
+}
+
 std::uint64_t perft_board(chess::Board& board, int depth) {
     if (depth == 0) return 1;
     chess::Movelist moves;
@@ -132,6 +190,12 @@ Position Position::from_fen(std::string_view fen) {
     return position;
 }
 
+Position Position::from_uci_history(std::string_view start_fen, const std::vector<std::string>& moves) {
+    Position position = from_fen(start_fen);
+    for (const auto& move : moves) position.push_uci(move);
+    return position;
+}
+
 std::string Position::fen() const { return board_.getFen(); }
 
 std::vector<std::string> Position::legal_moves_uci() const {
@@ -142,6 +206,74 @@ std::vector<std::string> Position::legal_moves_uci() const {
     for (const auto& move : moves) result.push_back(move_uci(board_, move));
     std::sort(result.begin(), result.end());
     return result;
+}
+
+std::vector<std::string> Position::history_uci() const {
+    return history_uci_;
+}
+
+std::vector<std::string> Position::history_fens(int max_steps) const {
+    if (max_steps < 1) throw std::invalid_argument("max_steps must be positive");
+    std::vector<std::string> result;
+    result.reserve(static_cast<std::size_t>(max_steps));
+    Position snapshot = *this;
+    result.push_back(snapshot.fen());
+    while (!snapshot.history_.empty() && static_cast<int>(result.size()) < max_steps) {
+        snapshot.pop();
+        result.push_back(snapshot.fen());
+    }
+    return result;
+}
+
+bool Position::is_repetition(int count) const {
+    if (count < 1) throw std::invalid_argument("repetition count must be positive");
+    if (count == 1) return true;
+
+    const auto key = transposition_key(board_);
+    int occurrences = 1;
+    Position snapshot = *this;
+    while (!snapshot.history_.empty()) {
+        snapshot.pop();
+        if (transposition_key(snapshot.board_) == key && ++occurrences >= count) return true;
+    }
+    return false;
+}
+
+std::optional<Outcome> Position::outcome(bool claim_draw) const {
+    const auto moves = legal_moves(board_);
+    if (moves.empty()) {
+        if (board_.inCheck()) {
+            return Outcome{board_.sideToMove() == chess::Color::WHITE ? "black" : "white", "checkmate"};
+        }
+    }
+    if (is_insufficient_material(board_)) return Outcome{"", "insufficient_material"};
+    if (moves.empty()) return Outcome{"", "stalemate"};
+
+    if (board_.halfMoveClock() >= 150) return Outcome{"", "seventyfive_moves"};
+    if (is_repetition(5)) return Outcome{"", "fivefold_repetition"};
+
+    if (!claim_draw) return std::nullopt;
+
+    if (board_.halfMoveClock() >= 100) return Outcome{"", "fifty_moves"};
+    if (board_.halfMoveClock() >= 99) {
+        for (const auto& move : moves) {
+            chess::Board after = board_;
+            after.makeMove<true>(move);
+            if (after.halfMoveClock() >= 100 && chess::movegen::anylegalmoves(after)) {
+                return Outcome{"", "fifty_moves"};
+            }
+        }
+    }
+
+    if (is_repetition(3)) return Outcome{"", "threefold_repetition"};
+    for (const auto& move : moves) {
+        Position after = *this;
+        after.history_uci_.push_back(move_uci(after.board_, move));
+        after.board_.makeMove<true>(move);
+        after.history_.push_back(move);
+        if (after.is_repetition(3)) return Outcome{"", "threefold_repetition"};
+    }
+    return std::nullopt;
 }
 
 void Position::push_uci(std::string_view uci) {
@@ -163,8 +295,9 @@ void Position::push_uci(std::string_view uci) {
     chess::movegen::legalmoves(moves, board_);
     for (const auto& move : moves) {
         if (move_uci(board_, move) == uci) {
-            board_.makeMove(move);
+            board_.makeMove<true>(move);
             history_.push_back(move);
+            history_uci_.emplace_back(uci);
             return;
         }
     }
@@ -175,6 +308,7 @@ void Position::pop() {
     if (history_.empty()) throw std::out_of_range("position history is empty");
     board_.unmakeMove(history_.back());
     history_.pop_back();
+    history_uci_.pop_back();
 }
 
 std::string Position::side_to_move() const {

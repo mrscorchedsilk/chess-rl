@@ -31,6 +31,16 @@ set_target_properties(native_perft_test PROPERTIES
 target_link_libraries(native_perft_test PRIVATE chess_rl_native_core)
 add_test(NAME native_perft_test COMMAND native_perft_test)
 
+add_executable(native_history_test native/tests/native_history_test.cpp)
+target_compile_features(native_history_test PRIVATE cxx_std_17)
+set_target_properties(native_history_test PROPERTIES
+  CXX_STANDARD 17
+  CXX_STANDARD_REQUIRED ON
+  CXX_EXTENSIONS OFF
+)
+target_link_libraries(native_history_test PRIVATE chess_rl_native_core)
+add_test(NAME native_history_test COMMAND native_history_test)
+
 pybind11_add_module(_chess_rl_native MODULE native/chess_rl_native.cpp)
 target_compile_features(_chess_rl_native PRIVATE cxx_std_17)
 set_target_properties(_chess_rl_native PROPERTIES

@@ -11,6 +11,17 @@
 namespace py = pybind11;
 
 namespace {
+py::object outcome_to_python(const std::optional<chess_rl_native::Outcome>& outcome) {
+    if (!outcome) return py::none();
+    py::dict result;
+    if (outcome->winner.empty())
+        result["winner"] = py::none();
+    else
+        result["winner"] = py::str(outcome->winner);
+    result["termination"] = outcome->termination;
+    return std::move(result);
+}
+
 py::dict build_info() {
     py::dict info;
     info["cxx_standard"] = "c++17";
@@ -32,8 +43,16 @@ PYBIND11_MODULE(_chess_rl_native, module) {
 
     py::class_<chess_rl_native::Position>(module, "Position")
         .def_static("from_fen", &chess_rl_native::Position::from_fen, py::arg("fen"))
+        .def_static("from_uci_history", &chess_rl_native::Position::from_uci_history,
+                    py::arg("start_fen"), py::arg("moves"))
         .def("fen", &chess_rl_native::Position::fen)
         .def("legal_moves_uci", &chess_rl_native::Position::legal_moves_uci)
+        .def("history_uci", &chess_rl_native::Position::history_uci)
+        .def("history_fens", &chess_rl_native::Position::history_fens, py::arg("max_steps") = 8)
+        .def("is_repetition", &chess_rl_native::Position::is_repetition, py::arg("count"))
+        .def("outcome", [](const chess_rl_native::Position& position, bool claim_draw) {
+            return outcome_to_python(position.outcome(claim_draw));
+        }, py::arg("claim_draw") = true)
         .def("push_uci", &chess_rl_native::Position::push_uci, py::arg("uci"))
         .def("pop", &chess_rl_native::Position::pop)
         .def("side_to_move", &chess_rl_native::Position::side_to_move)
