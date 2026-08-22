@@ -7,6 +7,9 @@ __version__ = "0.1.0"
 Position = _native.Position
 perft = _native.perft
 
+# Native MCTS core (Task 5): batched PUCT search, semantics-matched to mcts.py.
+MCTS = _native.MCTS
+
 # Policy / action-map constants (AlphaZero 73-plane policy).
 POLICY_PLANES = _native.POLICY_PLANES
 POLICY_SIZE = _native.POLICY_SIZE
@@ -43,6 +46,7 @@ __all__ = [
     "__version__",
     "Position",
     "perft",
+    "MCTS",
     "POLICY_PLANES",
     "POLICY_SIZE",
     "QUEEN_PLANES",

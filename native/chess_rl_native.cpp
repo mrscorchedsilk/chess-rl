@@ -8,6 +8,7 @@
 #include <string>
 
 #include "chess.hpp"
+#include "mcts.h"
 #include "policy.h"
 #include "position.h"
 
@@ -78,6 +79,60 @@ py::array_t<float> legal_move_mask(const Position& position) {
     return mask;
 }
 
+// ---------------------------------------------------------------------------
+// MCTS (Task 5): gather_leaves / apply_evaluations tensor marshalling
+// ---------------------------------------------------------------------------
+
+// gather_leaves -> (tokens, inputs, legal_offsets, legal_indices)
+//
+//   tokens:          list[int] length B (opaque; passed back to
+//                    apply_evaluations unchanged; token i == leaf i)
+//   inputs:          float32 [B, 104, 8, 8] C-contiguous (encode_planes output)
+//   legal_offsets:   int32 [B+1] CSR row pointers
+//   legal_indices:   int32 [K] flat, sorted ascending within each row
+py::tuple mcts_gather_leaves(MCTS& self, int max_batch) {
+    const MCTS::GatherResult result = self.gather_leaves(max_batch);
+    const int B = static_cast<int>(result.leaves.size());
+
+    std::vector<int> tokens(static_cast<std::size_t>(B));
+    for (int i = 0; i < B; ++i) tokens[static_cast<std::size_t>(i)] = i;
+
+    py::array_t<float> inputs({B, 104, 8, 8});
+    float* in_ptr = inputs.mutable_data();
+    for (int i = 0; i < B; ++i) {
+        const auto& planes = result.leaves[static_cast<std::size_t>(i)].planes;
+        std::copy(planes.begin(), planes.end(),
+                  in_ptr + static_cast<std::size_t>(i) * (104 * 64));
+    }
+
+    py::array_t<std::int32_t> offsets(result.legal_offsets.size());
+    std::copy(result.legal_offsets.begin(), result.legal_offsets.end(),
+              offsets.mutable_data());
+
+    py::array_t<std::int32_t> indices(result.legal_indices.size());
+    std::copy(result.legal_indices.begin(), result.legal_indices.end(),
+              indices.mutable_data());
+
+    return py::make_tuple(tokens, inputs, offsets, indices);
+}
+
+void mcts_apply_evaluations(
+    MCTS& self, const std::vector<int>& tokens,
+    const py::array_t<std::int32_t, py::array::c_style | py::array::forcecast>&
+        offsets_arr,
+    const py::array_t<float, py::array::c_style | py::array::forcecast>&
+        logits_arr,
+    const py::array_t<float, py::array::c_style | py::array::forcecast>&
+        values_arr) {
+    const std::vector<std::int32_t> offsets(offsets_arr.data(),
+                                            offsets_arr.data() + offsets_arr.size());
+    const std::vector<float> logits(logits_arr.data(),
+                                    logits_arr.data() + logits_arr.size());
+    const std::vector<float> values(values_arr.data(),
+                                    values_arr.data() + values_arr.size());
+    self.apply_evaluations(tokens, offsets, logits, values);
+}
+
 }  // namespace
 }  // namespace chess_rl_native
 
@@ -129,4 +184,20 @@ PYBIND11_MODULE(_chess_rl_native, module) {
         .def("encode", &encode_position, py::arg("history_steps") = 8);
 
     module.def("perft", &perft, py::arg("fen"), py::arg("depth"));
+
+    // MCTS (Task 5): batched PUCT search core, semantics-matched to mcts.py.
+    py::class_<MCTS>(module, "MCTS")
+        .def(py::init<double, double, int, double, double, std::uint64_t>(),
+             py::arg("c_puct") = 1.25, py::arg("virtual_loss") = 3.0,
+             py::arg("num_simulations") = 100, py::arg("dirichlet_alpha") = 0.3,
+             py::arg("dirichlet_epsilon") = 0.25, py::arg("seed") = 42)
+        .def("set_root", &MCTS::set_root, py::arg("start_fen"),
+             py::arg("history_moves"))
+        .def("gather_leaves", &mcts_gather_leaves, py::arg("max_batch"))
+        .def("apply_evaluations", &mcts_apply_evaluations, py::arg("tokens"),
+             py::arg("legal_offsets"), py::arg("legal_logits"),
+             py::arg("values"))
+        .def("is_complete", &MCTS::is_complete)
+        .def("policy", &MCTS::policy, py::arg("temperature") = 0.0)
+        .def("root_visit_counts", &MCTS::root_visit_counts);
 }
