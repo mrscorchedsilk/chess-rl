@@ -31,7 +31,7 @@ EXPECTED_GATES = [
     "canary",
 ]
 
-MISSING_ARTIFACT_GATES = ["native_cpp", "gpu_runtime", "resume", "canary"]
+MISSING_ARTIFACT_GATES = ["gpu_runtime", "resume", "canary"]
 
 PASS_CODE = "import sys; sys.exit(0)"
 FAIL_CODE = "import sys; sys.exit(1)"
@@ -108,10 +108,18 @@ class TestSchema:
     def test_default_registry_has_no_forbidden_training_entrypoints(self):
         gr.validate_registry(gr.DEFAULT_GATES)
 
-    def test_required_gates_are_the_six_real_gates(self):
+    def test_native_cpp_gate_rebuilds_verified_foundation(self):
+        gate = gr.DEFAULT_GATES["native_cpp"]
+        assert gate.kind == "command"
+        assert gate.required is True
+        assert "scripts/native_foundation_gate.py" in gate.cmd
+        assert "--json" in gate.cmd
+
+    def test_required_gates_include_native_foundation(self):
         required = {gid for gid, g in gr.DEFAULT_GATES.items() if g.required}
         assert required == {"pytest", "smoke_test", "checkpoint_helpers",
-                            "light_chess", "dashboard", "parallel_pipeline"}
+                            "light_chess", "dashboard", "parallel_pipeline",
+                            "native_cpp"}
 
 
 # ---------------------------------------------------------------------------

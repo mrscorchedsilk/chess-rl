@@ -214,13 +214,12 @@ DEFAULT_GATES = {
     ),
     "native_cpp": GateSpec(
         id="native_cpp",
-        description="Native C++ rules/MCTS build and parity tests",
-        kind="skip",
-        skip_reason=(
-            "missing-artifact: native C++ build/parity artifacts "
-            "(native-foundation track) are not present in this checkout"
-        ),
-        required=False,
+        description="Clean native C++17 wheel build, CTest and exact perft",
+        cmd=("{python}", "scripts/native_foundation_gate.py",
+             "--repo", "{repo}", "--json", "{evidence}/native_foundation.json"),
+        cwd="repo",
+        timeout_s=900.0,
+        required=True,
     ),
     "gpu_runtime": GateSpec(
         id="gpu_runtime",
