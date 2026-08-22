@@ -43,6 +43,8 @@ Sprint A/D reliability contract:
     protocol on the success path.
 """
 
+import json
+import os
 import queue
 import threading
 import time
@@ -53,6 +55,33 @@ import torch
 
 import encoding
 from selfplay import play_game
+
+
+def _profile_event(event, **fields):
+    """Append one opt-in JSONL profiling event.
+
+    ``CHESS_PROFILE_JSONL`` is deliberately checked at call time so spawned
+    workers inherit the same destination without any queue or shared Python
+    object.  A single ``os.write`` to an ``O_APPEND`` descriptor keeps each
+    short event line intact when several workers emit concurrently.  When the
+    variable is unset the hot path performs only one environment lookup.
+    """
+    path = os.environ.get("CHESS_PROFILE_JSONL")
+    if not path:
+        return
+    row = {
+        "event": str(event),
+        "pid": os.getpid(),
+        "wall_time": time.time(),
+        "monotonic_ns": time.perf_counter_ns(),
+    }
+    row.update(fields)
+    payload = (json.dumps(row, sort_keys=True, separators=(",", ":")) + "\n").encode()
+    fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+    try:
+        os.write(fd, payload)
+    finally:
+        os.close(fd)
 
 
 def planes_to_board(planes):
@@ -156,12 +185,20 @@ class InferenceClient:
             raise RuntimeError(
                 f"inference request queue stayed full for {self.timeout}s"
             ) from None
+        _profile_event("inference_request_sent", positions=int(xs.shape[0]))
+        wait_started_ns = time.perf_counter_ns()
         try:
             payload, values, kind = self._resp.get(timeout=self.timeout)
         except queue.Empty:
             raise RuntimeError(
                 f"inference server did not respond within {self.timeout}s"
             ) from None
+        _profile_event(
+            "inference_reply_received",
+            positions=int(xs.shape[0]),
+            kind=str(kind),
+            wait_ms=(time.perf_counter_ns() - wait_started_ns) / 1_000_000.0,
+        )
 
         if kind == "error":
             msg = payload if isinstance(payload, str) and payload else "inference server error"
@@ -281,11 +318,24 @@ class InferenceServer:
     def _process(self, jobs):
         """Coalesce `jobs`, run one forward pass, and reply per requester."""
         xs_cat = np.concatenate([x for _, x in jobs], axis=0)
+        profiling = bool(os.environ.get("CHESS_PROFILE_JSONL"))
+
+        def mark_time():
+            if profiling and str(self.device).startswith("cuda"):
+                torch.cuda.synchronize(self.device)
+            return time.perf_counter_ns() if profiling else 0
+
+        _profile_event("batch_formed", jobs=len(jobs), positions=int(xs_cat.shape[0]))
+        total_started = mark_time()
+        x_device = torch.from_numpy(xs_cat).to(self.device)
+        h2d_done = mark_time()
         with self.lock:
             with torch.no_grad():
-                logits, values = self.net(torch.from_numpy(xs_cat).to(self.device))
+                logits, values = self.net(x_device)
+        forward_done = mark_time()
         logits_np = logits.float().cpu().numpy()
         values_np = values.float().cpu().numpy()
+        d2h_done = mark_time()
 
         if self.sparse_response:
             boards = [planes_to_board(x) for x in xs_cat]
@@ -296,6 +346,18 @@ class InferenceServer:
             ]
         else:
             legal_idx = None
+        legal_done = mark_time()
+        if profiling:
+            _profile_event(
+                "inference_batch_completed",
+                jobs=len(jobs),
+                positions=int(xs_cat.shape[0]),
+                h2d_ms=(h2d_done - total_started) / 1_000_000.0,
+                forward_ms=(forward_done - h2d_done) / 1_000_000.0,
+                d2h_ms=(d2h_done - forward_done) / 1_000_000.0,
+                legal_ms=(legal_done - d2h_done) / 1_000_000.0,
+                total_ms=(legal_done - total_started) / 1_000_000.0,
+            )
 
         idx = 0
         for resp_q, xs in jobs:
@@ -310,6 +372,7 @@ class InferenceServer:
                 payload = logits_np[idx:idx + n]
                 kind = "dense"
             resp_q.put((payload, values_np[idx:idx + n], kind))
+            _profile_event("inference_reply_sent", positions=int(n), kind=kind)
             idx += n
 
 
@@ -366,13 +429,39 @@ def worker_loop(cfg, request_queue, response_queue, result_queue, seed, stop_eve
         policy_size=getattr(cfg, "policy_size", None),
         timeout=timeout,
     )
+    _profile_event("worker_started", worker=worker_id, seed=int(seed))
 
     try:
         while not stop_event.is_set():
             game_generation = (
                 int(generation_value.value) if generation_value is not None else None
             )
-            examples = play_game(client, cfg)
+            game_started_ns = time.perf_counter_ns()
+            _profile_event(
+                "game_started", worker=worker_id, generation=game_generation,
+            )
+            profile_path = os.environ.get("CHESS_PROFILE_JSONL")
+            if profile_path:
+                examples = play_game(
+                    client,
+                    cfg,
+                    on_ply=lambda ply: _profile_event(
+                        "ply_completed", worker=worker_id,
+                        generation=game_generation, ply=int(ply),
+                    ),
+                )
+            else:
+                # Preserve the legacy two-argument callback contract for tests
+                # and downstream callers when profiling is disabled.
+                examples = play_game(client, cfg)
+            _profile_event(
+                "game_completed",
+                worker=worker_id,
+                generation=game_generation,
+                plies=len(examples),
+                examples=len(examples),
+                game_ms=(time.perf_counter_ns() - game_started_ns) / 1_000_000.0,
+            )
             envelope = examples if worker_id is None else {
                 "kind": "game", "worker": worker_id, "examples": examples,
                 "generation": game_generation,

@@ -48,12 +48,14 @@ def _select_move(pi, temperature):
     return moves[np.random.choice(len(moves), p=probs)]
 
 
-def play_game(net, cfg):
+def play_game(net, cfg, on_ply=None):
     """Play one self-play game with MCTS and return the training examples.
 
     At each ply the search runs with temperature=cfg.temperature for the
     first cfg.temperature_threshold plies and temperature=0.0 afterwards.
     The game is capped at cfg.max_game_length plies (treated as a draw).
+    ``on_ply``, when supplied, receives the completed one-based ply count and
+    is intended for opt-in diagnostics; normal self-play pays no callback cost.
     """
     mcts = MCTS(net, cfg)
     board = chess.Board()
@@ -75,6 +77,8 @@ def play_game(net, cfg):
 
         move = _select_move(pi, temperature)
         board.push(move)
+        if on_ply is not None:
+            on_ply(len(board.move_stack))
 
     # Game over: compute the result from each side-to-move's perspective.
     terminal, white_result = _terminal_result(board)

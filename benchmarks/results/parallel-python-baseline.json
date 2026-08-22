@@ -1,0 +1,44 @@
+{
+  "backend": "python-processes",
+  "device": "cuda",
+  "examples": 253,
+  "four_game_under_30s": true,
+  "games": 4,
+  "games_per_hour": 1093.209743608974,
+  "max_game_length": 400,
+  "mcts_batch_size": 32,
+  "profile": {
+    "batch_positions": {
+      "count": 1285,
+      "max": 128,
+      "median": 9,
+      "min": 1
+    },
+    "event_counts": {
+      "batch_formed": 1285,
+      "game_completed": 4,
+      "game_started": 8,
+      "inference_batch_completed": 1285,
+      "inference_reply_received": 1905,
+      "inference_reply_sent": 1906,
+      "inference_request_sent": 1906,
+      "ply_completed": 635,
+      "worker_started": 4
+    },
+    "games_completed": 4,
+    "plies_completed": 253,
+    "timing_ms": {
+      "d2h": 245.82813099999996,
+      "forward": 3253.165225999999,
+      "h2d": 240.2733269999998,
+      "legal": 6869.617548999988,
+      "total": 10608.884232999982
+    },
+    "transfer_fraction_of_measured_batch": 0.04582022457064176
+  },
+  "profile_jsonl": "/tmp/chess-parallel-profile.jsonl",
+  "schema": 1,
+  "simulations": 40,
+  "wall_seconds": 13.172220687003573,
+  "workers": 4
+}
