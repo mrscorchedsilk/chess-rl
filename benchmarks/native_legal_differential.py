@@ -131,14 +131,14 @@ def _piece_at(placement: str, square: str):
 def effective_ep(native) -> str:
     """Native EP square normalized to python-chess legal-EP semantics.
 
-    chess-library stores the EP square on a double pawn push whenever an enemy
-    pawn *pseudo-legally* attacks it (``makeMove`` with the default
-    ``EXACT=false``), whereas python-chess's legal-EP FEN field only exists
-    when a legal en passant capture is possible. The legal-EP value is derived
-    from the native legal move set: the EP capture is the only legal *pawn*
-    move from the adjacent-file pawn square onto the (empty) EP square, so a
-    non-pawn move landing on the EP square (for example a bishop or queen)
-    must not be counted.
+    The native position already stores legal-EP semantics (``setFen`` drops an
+    EP square with no capturer and ``makeMove<true>`` records it only when a
+    legal capture exists), matching python-chess's legal-EP FEN field. This
+    helper re-derives the legal-EP value from the native legal move set as a
+    defence-in-depth: the EP capture is the only legal *pawn* move from the
+    adjacent-file pawn square onto the (empty) EP square, so a non-pawn move
+    landing on the EP square (for example a bishop or queen) must not be
+    counted.
     """
     raw = native.ep_square()
     if raw == "-":

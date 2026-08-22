@@ -156,15 +156,17 @@ def test_native_effective_ep_capturable_and_pinned():
 
 def test_native_effective_ep_bishop_covering_ep_square():
     # Regression from the 100k corpus (position 84422): after black's e7e5
-    # the raw EP square is e6, the d5 pawn is pinned by the d8 queen (so
-    # d5xe6 is illegal), and the f5 bishop can legally land on e6. A non-pawn
-    # move onto the EP square must not be mistaken for a legal en passant
-    # capture.
+    # the EP square would be e6, but the d5 pawn is pinned by the d8 queen
+    # (so d5xe6 is illegal) and the f5 bishop can legally land on e6. A
+    # non-pawn move onto the EP square must not be mistaken for a legal en
+    # passant capture. The native position stores *legal-EP* semantics
+    # (setFen validates the EP square and makeMove<true> records it only when
+    # a legal capture exists), so ep_square() reports "-" here.
     before = chess_rl_native.Position.from_fen(
         "1r1q4/p1p1p3/Pp3n1k/3P1Br1/1PP2P1p/8/3KNP1P/RN1R4 b - - 0 45"
     )
     before.push_uci("e7e5")
-    assert before.ep_square() == "e6"  # native raw (pseudo-legal) storage
+    assert before.ep_square() == "-"  # no legal en passant (d5 pawn pinned)
     assert "d5e6" not in before.legal_moves_uci()  # pinned pawn cannot take e.p.
     assert "f5e6" in before.legal_moves_uci()  # bishop lands on the EP square
     assert harness.effective_ep(before) == "-"
