@@ -12,3 +12,4 @@ stats.json
 htmlcov/
 build/
 dist/
+evidence/
