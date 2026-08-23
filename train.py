@@ -1583,6 +1583,8 @@ def build_parser():
     p.add_argument("--games-per-iteration", type=int, default=None)
     p.add_argument("--num-iterations", type=int, default=None)
     p.add_argument("--arena-every", type=int, default=None)
+    p.add_argument("--checkpoint-dir", type=str, default=None,
+                   help="override the checkpoint directory (default: checkpoints/v2)")
     return p
 
 
@@ -1593,7 +1595,7 @@ def main(argv=None):
     cfg = None
     if any(v is not None for v in (
             args.num_simulations, args.games_per_iteration,
-            args.num_iterations, args.arena_every)):
+            args.num_iterations, args.arena_every, args.checkpoint_dir)):
         cfg = Config()
         if args.num_simulations is not None:
             cfg.num_simulations = args.num_simulations
@@ -1603,6 +1605,8 @@ def main(argv=None):
             cfg.num_iterations = args.num_iterations
         if args.arena_every is not None:
             cfg.arena_every = args.arena_every
+        if args.checkpoint_dir is not None:
+            cfg.checkpoint_dir = args.checkpoint_dir
 
     if args.selfplay_backend == "native":
         run_native(cfg=cfg, resume=args.resume,

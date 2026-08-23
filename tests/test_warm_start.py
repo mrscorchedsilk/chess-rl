@@ -116,6 +116,13 @@ def test_resume_and_warm_start_mutually_exclusive():
         parser.parse_args(["--resume", "--warm-start-checkpoint", "/tmp/x.pt"])
 
 
+def test_checkpoint_dir_flag():
+    args = train.build_parser().parse_args(["--checkpoint-dir", "/tmp/ck"])
+    assert args.checkpoint_dir == "/tmp/ck"
+    # absent by default
+    assert train.build_parser().parse_args([]).checkpoint_dir is None
+
+
 # --------------------------------------------------------------------------- #
 #  B + I. load best / reject incompatible architecture                        #
 # --------------------------------------------------------------------------- #
