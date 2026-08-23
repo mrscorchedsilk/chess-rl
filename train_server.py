@@ -93,6 +93,7 @@ class Controller:
         self.run_id = None
         self.returncode = None
         self.error = None
+        self.checkpoint_dir = None   # active run's checkpoint dir (else default)
 
     # -- internals ---------------------------------------------------------- #
 
@@ -173,6 +174,7 @@ class Controller:
             self.workers = workers
             self.resume = resume
             self.backend = backend
+            self.checkpoint_dir = checkpoint_dir
             self.run_id = "run-%d-%d" % (self.proc.pid, int(self.started_at))
             return {"ok": True, "pid": self.proc.pid, "workers": workers,
                     "resume": resume, "backend": backend,
@@ -386,14 +388,20 @@ def _read_resources():
     return out
 
 
+def _active_checkpoint_dir():
+    """The ACTIVE run's checkpoint dir (set by start()), else the default."""
+    return getattr(CTRL, "checkpoint_dir", None) or CHECKPOINT_DIR
+
+
 def _checkpoint_info():
     """Honest checkpoint inventory: best/latest existence + versioned counts."""
     info = {"any": False, "best": False, "latest": False,
             "versioned_snapshots": 0, "archived_best": 0}
-    if not os.path.isdir(CHECKPOINT_DIR):
+    ck_dir = _active_checkpoint_dir()
+    if not os.path.isdir(ck_dir):
         return info
     try:
-        files = os.listdir(CHECKPOINT_DIR)
+        files = os.listdir(ck_dir)
     except Exception:
         return info
     snapshots = [f for f in files if re.match(r"^ckpt-iter\d+-.*\.pt$", f)]
@@ -419,7 +427,7 @@ def _checkpoint_meta():
     Read as plain JSON — NEVER torch.load: latest.pt may embed a huge replay
     buffer and must not be touched on the status polling path.
     """
-    path = os.path.join(CHECKPOINT_DIR, "checkpoint_meta.json")
+    path = os.path.join(_active_checkpoint_dir(), "checkpoint_meta.json")
     try:
         with open(path) as f:
             meta = json.load(f)
@@ -440,7 +448,7 @@ def _saved_iteration(recs, meta):
         return int(si)
     best = -1
     try:
-        for f in os.listdir(CHECKPOINT_DIR):
+        for f in os.listdir(_active_checkpoint_dir()):
             m = re.match(r"^ckpt-iter(\d+)-", f)
             if m:
                 best = max(best, int(m.group(1)))

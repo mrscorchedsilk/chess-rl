@@ -361,6 +361,25 @@ def test_checkpoint_meta_missing_falls_back_gracefully(ctrl, tmp_path):
 #  checkpoints: honest counts, no misleading '0 checkpoints'                   #
 # --------------------------------------------------------------------------- #
 
+def test_checkpoint_telemetry_follows_active_checkpoint_dir(ctrl, tmp_path):
+    """checkpoint telemetry must read the ACTIVE run's checkpoint_dir (set by
+    start()), falling back to CHECKPOINT_DIR when none is active."""
+    custom = tmp_path / "custom"
+    custom.mkdir()
+    with open(custom / "checkpoint_meta.json", "w") as f:
+        json.dump({"iteration": 42, "run_id": "run-X", "generation": 2}, f)
+    (custom / "best.pt").touch()
+
+    # no active checkpoint_dir -> falls back to the (monkeypatched) default
+    ctrl.checkpoint_dir = None
+    assert ts._checkpoint_meta() == {}
+
+    # active checkpoint_dir -> telemetry reads it
+    ctrl.checkpoint_dir = str(custom)
+    assert ts._checkpoint_meta()["iteration"] == 42
+    assert ts._checkpoint_info()["best"] is True
+
+
 def test_checkpoint_info_not_misleading(ctrl, tmp_path):
     ck = ts._checkpoint_info()
     assert ck["any"] is False and ck["best"] is False and ck["latest"] is False
