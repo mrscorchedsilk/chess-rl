@@ -439,27 +439,29 @@ def test_arena_points_event_only():
 def test_dashboard_static_contract():
     html = open(DASHBOARD, encoding="utf-8").read()
     for ident in [
-        "t-run", "t-gen", "t-iter-live", "t-iter-saved",
-        "t-loss-total", "t-loss-policy", "t-loss-value",
-        "t-replay", "t-opt-steps", "res-head", "offline", "errbanner",
+        "kpi-games", "kpi-rate", "kpi-elo", "kpi-win", "kpi-gen",
+        "kpi-uptime", "kpi-err", "kpi-replay",
+        "chart-loss", "chart-games", "chart-rate", "chart-elo", "chart-arena",
+        "btn-start", "btn-stop", "cfg-workers", "err-banner", "offline",
+        "ckpt-none", "impr-elo", "impr-verdict", "hist-body",
     ]:
         assert ('id="%s"' % ident) in html, "dashboard missing #%s" % ident
-    # worker recommendation 8
-    assert 'id="inp-workers"' in html
+    # worker default 8
+    assert 'id="cfg-workers"' in html
     assert 'value="8"' in html
-    assert "sweet spot" in html
-    # same-origin: no hardcoded LAN/Tailscale IP; apiBase defaults to ''
+    # same-origin: no hardcoded LAN/Tailscale IP
     assert "100.84" not in html
-    assert "return q || ''" in html
-    # RAM-aware headroom (client-side fallback must consider RAM)
-    assert "r.ram" in html
     # checkpoints: never the misleading '0 checkpoints'; has a none-yet label
     assert "0 checkpoints" not in html
-    assert "none yet" in html
+    assert "no checkpoint" in html
     # clear stale/offline/error states
-    assert "stale" in html.lower()
+    assert "STALE" in html
     assert "offline" in html.lower()
-    assert "errbanner" in html
+    assert "err-banner" in html
+    assert "ERROR" in html
+    # per-run history + event-only arena points (event === 'arena')
+    assert "run_id" in html
+    assert "event === 'arena'" in html
 
 
 def test_dashboard_javascript_test_runs_clean():

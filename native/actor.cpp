@@ -1,5 +1,6 @@
 #include "actor.h"
 
+#include <algorithm>
 #include <stdexcept>
 
 namespace chess_rl_native {
@@ -32,10 +33,11 @@ Actor::GameState::GameState(double c_puct, double virtual_loss,
 Actor::Actor(int games, double c_puct, double virtual_loss,
              int num_simulations, double temperature,
              int temperature_threshold, int max_game_length,
-             std::uint64_t seed)
+             std::uint64_t seed, int num_threads)
     : temperature_(temperature),
       temperature_threshold_(temperature_threshold),
-      max_game_length_(max_game_length) {
+      max_game_length_(max_game_length),
+      num_threads_(num_threads > 0 ? num_threads : games) {
     if (games <= 0) throw std::invalid_argument("games must be positive");
     if (num_simulations < 0)
         throw std::invalid_argument("num_simulations must be >= 0");
@@ -61,6 +63,28 @@ Actor::Actor(int games, double c_puct, double virtual_loss,
         game.pos = Position::from_uci_history(START_FEN, {});
         game.mcts.set_root(START_FEN, {});
     }
+}
+
+void Actor::parallel_for(const std::function<void(int)>& fn) {
+    const int n = static_cast<int>(games_.size());
+    const int t = std::max(1, std::min(num_threads_, n));
+    if (t <= 1) {
+        for (int g = 0; g < n; ++g) fn(g);
+        return;
+    }
+    std::atomic<int> next{0};
+    std::vector<std::thread> pool;
+    pool.reserve(static_cast<std::size_t>(t));
+    for (int i = 0; i < t; ++i) {
+        pool.emplace_back([&]() {
+            for (;;) {
+                const int g = next.fetch_add(1, std::memory_order_relaxed);
+                if (g >= n) break;
+                fn(g);
+            }
+        });
+    }
+    for (auto& th : pool) th.join();
 }
 
 void Actor::set_teacher(int weight_version, int generation) {
@@ -92,12 +116,21 @@ Actor::GatherResult Actor::gather_leaves(int max_batch) {
     }
     const int per_game = std::max(1, max_batch / in_play);
 
-    for (std::size_t g = 0; g < games_.size(); ++g) {
-        GameState& game = games_[g];
-        game_base_[g] = static_cast<int>(result.leaves.size());
-        if (game.finished || game.mcts.is_complete()) continue;
+    // Gather each in-play game's leaves in parallel (games are fully
+    // independent: each owns its MCTS, board and RNG), then merge serially in
+    // game order so the merged CSR and leaf->game routing stay deterministic.
+    const std::size_t G = games_.size();
+    std::vector<MCTS::GatherResult> local(G);
+    parallel_for([&](int g) {
+        GameState& game = games_[static_cast<std::size_t>(g)];
+        if (game.finished || game.mcts.is_complete()) return;
+        local[static_cast<std::size_t>(g)] =
+            game.mcts.gather_leaves(per_game);
+    });
 
-        MCTS::GatherResult gr = game.mcts.gather_leaves(per_game);
+    for (std::size_t g = 0; g < G; ++g) {
+        game_base_[g] = static_cast<int>(result.leaves.size());
+        MCTS::GatherResult& gr = local[g];
         for (auto& leaf : gr.leaves) {
             leaf_game_.push_back(static_cast<int>(g));
             result.leaves.push_back(std::move(leaf));
@@ -112,7 +145,7 @@ Actor::GatherResult Actor::gather_leaves(int max_batch) {
         for (std::size_t i = 1; i < gr.legal_offsets.size(); ++i)
             result.legal_offsets.push_back(block_base + gr.legal_offsets[i]);
     }
-    game_base_[games_.size()] = static_cast<int>(result.leaves.size());
+    game_base_[G] = static_cast<int>(result.leaves.size());
     return result;
 }
 
@@ -158,31 +191,45 @@ void Actor::apply_evaluations(const std::vector<int>& tokens,
             t - game_base_[static_cast<std::size_t>(g)]);
     }
 
-    for (std::size_t g = 0; g < games_.size(); ++g) {
+    // Build each game's own CSR slice (serial, cheap), then apply evaluations
+    // in parallel (each game's MCTS.apply_evaluations is independent).
+    struct GameSlice {
+        std::vector<int> tokens;
+        std::vector<std::int32_t> offsets;
+        std::vector<float> logits;
+        std::vector<float> values;
+    };
+    const std::size_t G = games_.size();
+    std::vector<GameSlice> slices(G);
+    for (std::size_t g = 0; g < G; ++g) {
         const int base = game_base_[g];
         const int len = game_base_[g + 1] - base;
+        GameSlice& s = slices[g];
         if (len == 0) continue;
+        s.tokens = game_tokens[g];
 
         // Reconstruct the game's own CSR row pointers: its gather's offsets
         // are the merged block shifted by the block's cumulative offset.
-        std::vector<std::int32_t> game_offsets;
-        game_offsets.reserve(static_cast<std::size_t>(len) + 1);
+        s.offsets.reserve(static_cast<std::size_t>(len) + 1);
         for (int i = 0; i <= len; ++i) {
-            game_offsets.push_back(
+            s.offsets.push_back(
                 legal_offsets[static_cast<std::size_t>(base + i)] -
                 legal_offsets[static_cast<std::size_t>(base)]);
         }
         const std::int32_t row_begin = legal_offsets[static_cast<std::size_t>(base)];
         const std::int32_t row_end =
             legal_offsets[static_cast<std::size_t>(base + len)];
-        std::vector<float> game_logits(
-            legal_logits.begin() + row_begin, legal_logits.begin() + row_end);
-        std::vector<float> game_values(
-            values.begin() + base, values.begin() + base + len);
-
-        games_[g].mcts.apply_evaluations(game_tokens[g], game_offsets,
-                                         game_logits, game_values);
+        s.logits.assign(legal_logits.begin() + row_begin,
+                        legal_logits.begin() + row_end);
+        s.values.assign(values.begin() + base, values.begin() + base + len);
     }
+
+    parallel_for([&](int g) {
+        GameSlice& s = slices[static_cast<std::size_t>(g)];
+        if (s.offsets.empty()) return;
+        games_[static_cast<std::size_t>(g)].mcts.apply_evaluations(
+            s.tokens, s.offsets, s.logits, s.values);
+    });
 
     leaf_game_.clear();
     game_base_.clear();
@@ -212,12 +259,13 @@ std::string Actor::sample_move(
     return policy[static_cast<std::size_t>(dist(rng))].first;
 }
 
-void Actor::finalise(GameState& game, float white_result,
+void Actor::finalise(int game_index, GameState& game, float white_result,
                      std::string termination) {
     Game done;
     done.teacher_generation = teacher_generation_;
     done.teacher_weight_version = teacher_weight_version_;
     done.result_termination = std::move(termination);
+    done.game_index = game_index;
     done.examples.reserve(game.examples.size());
     for (Example& ex : game.examples) {
         // z-value convention (selfplay.py): from the side-to-move's view.
@@ -226,13 +274,14 @@ void Actor::finalise(GameState& game, float white_result,
     }
     game.examples.clear();
     game.finished = true;
+    std::lock_guard<std::mutex> lock(finished_mutex_);
     finished_.push_back(std::move(done));
 }
 
 void Actor::advance() {
-    for (std::size_t g = 0; g < games_.size(); ++g) {
-        GameState& game = games_[g];
-        if (game.finished || !game.mcts.is_complete()) continue;
+    parallel_for([&](int g) {
+        GameState& game = games_[static_cast<std::size_t>(g)];
+        if (game.finished || !game.mcts.is_complete()) return;
 
         const int ply = static_cast<int>(game.pos->history_uci().size());
         const double temp =
@@ -250,8 +299,8 @@ void Actor::advance() {
             const float white_result =
                 outcome->winner.empty() ? 0.0f
                 : (outcome->winner == "w" ? 1.0f : -1.0f);
-            finalise(game, white_result, outcome->termination);
-            continue;
+            finalise(g, game, white_result, outcome->termination);
+            return;
         }
 
         // Record the training example BEFORE the move is played.
@@ -274,27 +323,32 @@ void Actor::advance() {
         // the claimable draws; the length cap is a draw.
         const int new_ply = static_cast<int>(game.pos->history_uci().size());
         if (new_ply >= max_game_length_) {
-            finalise(game, 0.0f, "length_cap");
-            continue;
+            finalise(g, game, 0.0f, "length_cap");
+            return;
         }
         if (const auto outcome = game.pos->outcome(/*claim_draw=*/true)) {
             const float white_result =
                 outcome->winner.empty() ? 0.0f
                 : (outcome->winner == "w" ? 1.0f : -1.0f);
-            finalise(game, white_result, outcome->termination);
-            continue;
+            finalise(g, game, white_result, outcome->termination);
+            return;
         }
 
         // Fresh search on the new position: rebuild from the standard start
         // FEN plus the full history (from_uci_history replays the moves, so
         // passing the CURRENT fen would replay them on top of itself).
         game.mcts.set_root(START_FEN, game.pos->history_uci());
-    }
+    });
 }
 
 std::vector<Game> Actor::finished_games() {
     std::vector<Game> out;
     out.swap(finished_);
+    // Parallel finalise() pushes games in completion order; sort back to game
+    // order so same-seed runs are byte-identical (determinism contract).
+    std::sort(out.begin(), out.end(), [](const Game& a, const Game& b) {
+        return a.game_index < b.game_index;
+    });
     return out;
 }
 

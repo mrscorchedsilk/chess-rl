@@ -83,7 +83,7 @@ class Config:
 
     # ---- misc ----
     max_game_length = 400       # plies hard cap -> draw
-    checkpoint_every_iterations = 1    # completed iterations between snapshots
+    checkpoint_every_iterations = 20    # completed iterations between snapshots
     checkpoint_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                   "checkpoints", "v2")   # versioned; legacy checkpoints/ untouched
     seed = 42

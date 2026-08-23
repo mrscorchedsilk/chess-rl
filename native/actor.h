@@ -1,9 +1,13 @@
 #pragma once
 
+#include <atomic>
 #include <cstdint>
+#include <functional>
+#include <mutex>
 #include <optional>
 #include <random>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -29,6 +33,7 @@ struct Game {
     int teacher_generation = -1;
     int teacher_weight_version = -1;
     std::string result_termination;
+    int game_index = -1;  // deterministic ordering key for parallel finalise
 };
 
 // Native multi-game self-play actor (AlphaZero style, mirroring selfplay.py):
@@ -47,7 +52,7 @@ class Actor {
   public:
     Actor(int games, double c_puct, double virtual_loss, int num_simulations,
           double temperature, int temperature_threshold, int max_game_length,
-          std::uint64_t seed);
+          std::uint64_t seed, int num_threads = 0);
 
     // Records the immutable (weight_version, generation) teacher handle that
     // produced every completed game. No weights are loaded here; the network
@@ -113,8 +118,18 @@ class Actor {
 
     // Finalises `game`: fills z-values from `white_result`, stamps the
     // teacher handle, and moves it to the finished queue.
-    void finalise(GameState& game, float white_result,
+    void finalise(int game_index, GameState& game, float white_result,
                   std::string termination);
+
+    // Runs fn(g) for g in [0, games_) across up to num_threads_ worker
+    // threads. Each game index is visited by exactly one thread; the games'
+    // MCTS/board/RNG state is fully independent so no per-game state is
+    // shared between threads (only `finished_` needs a lock, taken in
+    // finalise()).
+    void parallel_for(const std::function<void(int)>& fn);
+
+    int num_threads_ = 1;
+    std::mutex finished_mutex_;
 
     double temperature_;
     int temperature_threshold_;

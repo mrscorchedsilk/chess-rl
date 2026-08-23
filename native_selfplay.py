@@ -59,6 +59,7 @@ class NativeSelfPlay:
             temperature_threshold=int(cfg.temperature_threshold),
             max_game_length=int(cfg.max_game_length),
             seed=int(cfg.seed),
+            num_threads=self.games,
         )
         self.actor.set_teacher(self.weight_version, self.generation)
 

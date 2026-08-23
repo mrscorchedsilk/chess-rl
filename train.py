@@ -1357,10 +1357,30 @@ if __name__ == "__main__":
         default="python",
         help="Self-play engine: python (worker processes) or native (C++ actor + GPU runtime)",
     )
+    p.add_argument("--num-simulations", type=int, default=None)
+    p.add_argument("--games-per-iteration", type=int, default=None)
+    p.add_argument("--num-iterations", type=int, default=None)
+    p.add_argument("--arena-every", type=int, default=None)
     args = p.parse_args()
+
+    # Apply runnable overrides to a Config before dispatch.
+    cfg = None
+    if any(v is not None for v in (
+            args.num_simulations, args.games_per_iteration,
+            args.num_iterations, args.arena_every)):
+        cfg = Config()
+        if args.num_simulations is not None:
+            cfg.num_simulations = args.num_simulations
+        if args.games_per_iteration is not None:
+            cfg.games_per_iteration = args.games_per_iteration
+        if args.num_iterations is not None:
+            cfg.num_iterations = args.num_iterations
+        if args.arena_every is not None:
+            cfg.arena_every = args.arena_every
+
     if args.selfplay_backend == "native":
-        run_native(resume=args.resume)
+        run_native(cfg=cfg, resume=args.resume)
     elif args.workers >= 2:
-        run_parallel(resume=args.resume, num_workers=args.workers)
+        run_parallel(cfg=cfg, resume=args.resume, num_workers=args.workers)
     else:
-        run(resume=args.resume)
+        run(cfg=cfg, resume=args.resume)

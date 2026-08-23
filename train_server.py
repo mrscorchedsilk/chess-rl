@@ -116,7 +116,9 @@ class Controller:
 
     # -- lifecycle ---------------------------------------------------------- #
 
-    def start(self, workers=8, resume=True, backend="python"):
+    def start(self, workers=8, resume=True, backend="python",
+              num_simulations=None, games_per_iteration=None,
+              num_iterations=None, arena_every=None):
         with self.lock:
             self._reap()
             if self.proc is not None:
@@ -129,6 +131,14 @@ class Controller:
                 cmd = [PYTHON, TRAIN_SCRIPT, "--workers", str(workers)]
             if resume:
                 cmd.append("--resume")
+            if num_simulations is not None:
+                cmd += ["--num-simulations", str(int(num_simulations))]
+            if games_per_iteration is not None:
+                cmd += ["--games-per-iteration", str(int(games_per_iteration))]
+            if num_iterations is not None:
+                cmd += ["--num-iterations", str(int(num_iterations))]
+            if arena_every is not None:
+                cmd += ["--arena-every", str(int(arena_every))]
 
             try:
                 with open(TRAIN_LOG, "a") as f:
@@ -625,7 +635,23 @@ class Handler(BaseHTTPRequestHandler):
             resume = data.get("resume", True)
             if not isinstance(resume, bool):
                 return self._json({"error": "resume must be a boolean"}, 400)
-            result = CTRL.start(workers=workers, resume=resume, backend=backend)
+
+            def _opt_int(key):
+                v = data.get(key)
+                if v is None:
+                    return None
+                try:
+                    return int(v)
+                except (TypeError, ValueError):
+                    return None
+
+            result = CTRL.start(
+                workers=workers, resume=resume, backend=backend,
+                num_simulations=_opt_int("num_simulations"),
+                games_per_iteration=_opt_int("games_per_iteration"),
+                num_iterations=_opt_int("num_iterations"),
+                arena_every=_opt_int("arena_every"),
+            )
         elif action == "stop":
             result = CTRL.stop()
         else:

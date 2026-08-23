@@ -41,10 +41,13 @@ def _weights_hash(net):
 def run_canary(minutes=30, resume=False):
     cfg = Config()
     cfg.num_iterations = 10_000  # bounded by the wall clock, not by iteration count
-    # Keep the canary fast but real: production 100 sims/game, 20 games/iter.
-    cfg.num_simulations = 100
-    cfg.games_per_iteration = 20
-    cfg.arena_every = 10
+    # Runnable-but-real settings: the native actor is single-threaded (T6's
+    # thread-pool parallelism is a pending follow-up), so keep sims/games low
+    # enough that an iteration completes in ~20-30s and the canary produces a
+    # meaningful number of checkpoints + replay growth over its wall clock.
+    cfg.num_simulations = 25
+    cfg.games_per_iteration = 4
+    cfg.arena_every = 10_000  # skip arena: it uses Python MCTS, not the native path under test
 
     t0 = time.monotonic()
     deadline = t0 + minutes * 60

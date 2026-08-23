@@ -3,6 +3,7 @@ project(chess_rl_native LANGUAGES CXX)
 
 find_package(Python COMPONENTS Interpreter Development.Module REQUIRED)
 find_package(pybind11 CONFIG REQUIRED)
+find_package(Threads REQUIRED)
 
 enable_testing()
 
@@ -24,6 +25,7 @@ target_include_directories(chess_rl_native_core PUBLIC
   "${CMAKE_CURRENT_SOURCE_DIR}/native"
   "${CMAKE_CURRENT_SOURCE_DIR}/native/third_party/chess-library/include"
 )
+target_link_libraries(chess_rl_native_core PUBLIC Threads::Threads)
 
 add_executable(native_perft_test native/tests/native_perft_test.cpp)
 target_compile_features(native_perft_test PRIVATE cxx_std_17)

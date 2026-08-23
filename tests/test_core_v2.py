@@ -73,7 +73,7 @@ def test_config_4672_contract():
     assert cfg.policy_size == cfg.policy_planes * 64
     assert cfg.replay_buffer_size == 50000
     assert cfg.selfplay_workers == 8
-    assert cfg.checkpoint_every_iterations == 1
+    assert cfg.checkpoint_every_iterations == 20
     assert cfg.result_timeout_seconds == 60
     assert cfg.training_epochs == 3
     assert cfg.arena_root_noise is False

@@ -282,12 +282,13 @@ PYBIND11_MODULE(_chess_rl_native, module) {
     // apply_evaluations routes the network output back per game.
     py::class_<Actor>(module, "Actor")
         .def(py::init<int, double, double, int, double, int, int,
-                      std::uint64_t>(),
+                      std::uint64_t, int>(),
              py::arg("games"), py::arg("c_puct") = 1.25,
              py::arg("virtual_loss") = 3.0,
              py::arg("num_simulations") = 100, py::arg("temperature") = 1.0,
              py::arg("temperature_threshold") = 30,
-             py::arg("max_game_length") = 400, py::arg("seed") = 42)
+             py::arg("max_game_length") = 400, py::arg("seed") = 42,
+             py::arg("num_threads") = 0)
         .def("set_teacher", &Actor::set_teacher, py::arg("weight_version"),
              py::arg("generation"))
         .def("gather_leaves", &actor_gather_leaves, py::arg("max_batch"))
