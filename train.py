@@ -715,6 +715,56 @@ def _snapshot_checkpoint(cfg, iteration):
     return versioned
 
 
+def _save_milestone(cfg, net, *, run_id, iteration, generation, outcome):
+    """Persist an arena-accepted champion as an immutable, weights-only
+    milestone under ``<checkpoint_dir>/milestones/``.
+
+    Each arena promotion is an objective strength improvement (the candidate
+    beat the incumbent under the deterministic paired-opening suite), so it is
+    worth keeping forever at ~8 MB — unlike the ~99 MB full resumable
+    snapshots, which are transient rollback material.  Milestones are never
+    overwritten; a JSON sidecar records arena provenance (W/D/L, score,
+    threshold) plus architecture identity, so each is self-describing and
+    re-loadable via the weights-only warm-start path.
+    """
+    milestones_dir = os.path.join(cfg.checkpoint_dir, "milestones")
+    os.makedirs(milestones_dir, exist_ok=True)
+    stem = (f"best-gen{int(generation):04d}-iter{int(iteration):04d}-"
+            f"{run_id}")
+    path = os.path.join(milestones_dir, stem + ".pt")
+    meta_path = os.path.join(milestones_dir, stem + ".json")
+    tmp = path + ".tmp"
+    torch.save(net.state_dict(), tmp)
+    os.replace(tmp, path)
+
+    meta = {
+        "schema_version": CHECKPOINT_SCHEMA_VERSION,
+        "checkpoint_format": CHECKPOINT_FORMAT_V3,
+        "run_id": run_id,
+        "iteration": int(iteration),
+        "generation": int(generation),
+        "architecture_id": getattr(net, "architecture_id", None),
+        "policy_size": int(getattr(cfg, "policy_size", 0)),
+        "num_input_planes": int(getattr(cfg, "num_input_planes", 0)),
+        "board_size": int(getattr(cfg, "board_size", 0)),
+        "arena": {
+            "wins": int(outcome.get("a", 0)),
+            "draws": int(outcome.get("draws", 0)),
+            "losses": int(outcome.get("b", 0)),
+            "score": float(outcome.get("score", 0.0)),
+            "accept_threshold": float(
+                getattr(cfg, "arena_accept_threshold", 0.55)),
+        },
+        "saved_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+    }
+    tmp_meta = meta_path + ".tmp"
+    with open(tmp_meta, "w") as f:
+        json.dump(meta, f, indent=2, sort_keys=True)
+    os.replace(tmp_meta, meta_path)
+    print(f"Saved arena milestone -> {os.path.basename(path)}", flush=True)
+    return path
+
+
 # --------------------------------------------------------------------------- #
 #  training / arena semantics                                                  #
 # --------------------------------------------------------------------------- #
@@ -1024,6 +1074,9 @@ def run(cfg=None, resume=False, on_iteration=None, warm_start_checkpoint=None):
                     best_net.load_state_dict(net.state_dict())
                     best_net.eval()
                     _save_best_atomic(cfg, best_net)
+                    _save_milestone(cfg, best_net, run_id=run_id,
+                                    iteration=iteration, generation=generation,
+                                    outcome=outcome)
                 else:
                     # Rejected challenger: revert to best and reset the
                     # optimizer so it can never silently become the teacher.
@@ -1264,6 +1317,9 @@ def run_parallel(cfg=None, resume=False, num_workers=None, on_iteration=None,
                     best_net.load_state_dict(net.state_dict())
                     best_net.eval()
                     _save_best_atomic(cfg, best_net)
+                    _save_milestone(cfg, best_net, run_id=run_id,
+                                    iteration=iteration, generation=generation,
+                                    outcome=outcome)
                 else:
                     net.load_state_dict(best_net.state_dict())
                     optimizer = _new_optimizer(cfg, net)
@@ -1479,6 +1535,9 @@ def run_native(cfg=None, resume=False, on_iteration=None,
                     best_net.load_state_dict(net.state_dict())
                     best_net.eval()
                     _save_best_atomic(cfg, best_net)
+                    _save_milestone(cfg, best_net, run_id=run_id,
+                                    iteration=iteration, generation=generation,
+                                    outcome=outcome)
                 else:
                     net.load_state_dict(best_net.state_dict())
                     optimizer = _new_optimizer(cfg, net)

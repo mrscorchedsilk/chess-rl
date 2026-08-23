@@ -13,3 +13,6 @@ htmlcov/
 build/
 dist/
 evidence/
+
+# Hermes agent workspace (plans, session artifacts)
+.hermes/
