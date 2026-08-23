@@ -118,7 +118,8 @@ class Controller:
 
     def start(self, workers=8, resume=True, backend="python",
               num_simulations=None, games_per_iteration=None,
-              num_iterations=None, arena_every=None):
+              num_iterations=None, arena_every=None,
+              warm_start_checkpoint=None, checkpoint_dir=None):
         with self.lock:
             self._reap()
             if self.proc is not None:
@@ -129,8 +130,14 @@ class Controller:
                 cmd = [PYTHON, TRAIN_SCRIPT, "--selfplay-backend", "native"]
             else:
                 cmd = [PYTHON, TRAIN_SCRIPT, "--workers", str(workers)]
-            if resume:
+            if warm_start_checkpoint is not None:
+                # Weights-only warm start (new lineage): mutually exclusive with
+                # --resume, so it suppresses the resume flag below.
+                cmd += ["--warm-start-checkpoint", str(warm_start_checkpoint)]
+            elif resume:
                 cmd.append("--resume")
+            if checkpoint_dir is not None:
+                cmd += ["--checkpoint-dir", str(checkpoint_dir)]
             if num_simulations is not None:
                 cmd += ["--num-simulations", str(int(num_simulations))]
             if games_per_iteration is not None:
@@ -645,12 +652,21 @@ class Handler(BaseHTTPRequestHandler):
                 except (TypeError, ValueError):
                     return None
 
+            warm_start_checkpoint = data.get("warm_start_checkpoint")
+            checkpoint_dir = data.get("checkpoint_dir")
+            if warm_start_checkpoint is not None and not isinstance(warm_start_checkpoint, str):
+                return self._json({"error": "warm_start_checkpoint must be a string"}, 400)
+            if checkpoint_dir is not None and not isinstance(checkpoint_dir, str):
+                return self._json({"error": "checkpoint_dir must be a string"}, 400)
+
             result = CTRL.start(
                 workers=workers, resume=resume, backend=backend,
                 num_simulations=_opt_int("num_simulations"),
                 games_per_iteration=_opt_int("games_per_iteration"),
                 num_iterations=_opt_int("num_iterations"),
                 arena_every=_opt_int("arena_every"),
+                warm_start_checkpoint=warm_start_checkpoint,
+                checkpoint_dir=checkpoint_dir,
             )
         elif action == "stop":
             result = CTRL.stop()
