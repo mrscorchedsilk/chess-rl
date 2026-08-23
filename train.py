@@ -67,6 +67,7 @@ from arena import play_match, generate_arena_openings, arena_suite_hash
 from parallel import InferenceServer, worker_loop
 from replay import ReplayBuffer, PinnedReplayLoader
 import native_selfplay
+import telemetry
 
 Adam = torch.optim.Adam  # module alias so tests can substitute a spy
 
@@ -102,6 +103,24 @@ class IncompatibleCheckpointError(RuntimeError):
 
 def _metrics_path(cfg):
     return getattr(cfg, "metrics_path", None) or METRICS_PATH
+
+
+def _gpu_stats(inference_fn):
+    """Canonical GPU-side inference counters from the runtime, or {}.
+
+    The trainer merges ``inference_fn.runtime.stats()`` into the per-iteration
+    ``resource`` / ``selfplay`` records (design §3.3).  The native self-play
+    numbers and the GPU-runtime numbers should agree; the relationship (not
+    exact equality across backends) is what the telemetry tests assert.
+    Swallow-guarded: a broken/missing runtime contributes nothing.
+    """
+    try:
+        runtime = getattr(inference_fn, "runtime", None)
+        if runtime is not None and hasattr(runtime, "stats"):
+            return dict(runtime.stats())
+    except Exception:  # noqa: BLE001 - telemetry must never kill training
+        pass
+    return {}
 
 
 def _log_metrics(cfg, *, run_id, iteration, generation, policy_loss,
@@ -360,50 +379,75 @@ def _save_latest(cfg, *, run_id, iteration, generation, optimizer_steps,
     the on-disk best can never run ahead of the resumable latest.pt (and is
     never stale either).  ``best_meta.json`` carries the true accepted
     generation.
+
+    Telemetry (Ticket A): the write runs inside a `PhaseTimer("checkpoint")`
+    and a swallow-guarded `phase` record (snapshot=False — the versioned
+    hardlink is emitted separately by ``_snapshot_checkpoint``) is appended on
+    exit.
     """
-    paths = _checkpoint_paths(cfg)
-    arch_id = getattr(net, "architecture_id", None)
-    payload = {
-        "schema_version": CHECKPOINT_SCHEMA_VERSION,
-        "checkpoint_format": CHECKPOINT_FORMAT_V3,
-        "architecture_id": arch_id,
-        "policy_size": int(cfg.policy_size),
-        "num_input_planes": int(cfg.num_input_planes),
-        "board_size": int(cfg.board_size),
-        "replay_capacity": int(cfg.replay_buffer_size),
-        "backend": _device_type(device if device is not None
-                                else getattr(cfg, "device", "cpu")),
-        "config_fingerprint": _config_fingerprint(cfg),
-        "scaler": scaler.state_dict() if scaler is not None else {},
-        "actor_rng": {
-            "numpy": np.random.get_state(),
-            "random": random.getstate(),
-        },
-        "run_id": run_id,
-        "iteration": int(iteration),
-        "generation": int(generation),
-        "optimizer_steps": int(optimizer_steps),
-        "candidate": net.state_dict(),
-        "best": best_net.state_dict(),
-        "optimizer": optimizer.state_dict(),
-        "torch_rng": torch.get_rng_state(),
-        "cuda_rng": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
-        "random_rng": random.getstate(),
-        "numpy_rng": np.random.get_state(),
-        "replay": buffer.state_dict(),
-        "config": _config_snapshot(cfg),
-    }
-    if provenance:
-        payload.update(provenance)
-    tmp = paths["latest"] + ".tmp"
-    torch.save(payload, tmp)
-    os.replace(tmp, paths["latest"])
-    _save_meta(cfg, run_id=run_id, iteration=iteration, generation=generation,
-               optimizer_steps=optimizer_steps, replay_size=len(buffer),
-               reason=reason, architecture_id=arch_id, provenance=provenance)
-    # Publish best AFTER latest so best.pt never runs ahead of resumable state.
-    _publish_best(cfg, best_net, run_id=run_id, iteration=iteration,
-                  generation=generation, architecture_id=arch_id)
+    with telemetry.PhaseTimer("checkpoint") as _ckpt_timer:
+        paths = _checkpoint_paths(cfg)
+        arch_id = getattr(net, "architecture_id", None)
+        payload = {
+            "schema_version": CHECKPOINT_SCHEMA_VERSION,
+            "checkpoint_format": CHECKPOINT_FORMAT_V3,
+            "architecture_id": arch_id,
+            "policy_size": int(cfg.policy_size),
+            "num_input_planes": int(cfg.num_input_planes),
+            "board_size": int(cfg.board_size),
+            "replay_capacity": int(cfg.replay_buffer_size),
+            "backend": _device_type(device if device is not None
+                                    else getattr(cfg, "device", "cpu")),
+            "config_fingerprint": _config_fingerprint(cfg),
+            "scaler": scaler.state_dict() if scaler is not None else {},
+            "actor_rng": {
+                "numpy": np.random.get_state(),
+                "random": random.getstate(),
+            },
+            "run_id": run_id,
+            "iteration": int(iteration),
+            "generation": int(generation),
+            "optimizer_steps": int(optimizer_steps),
+            "candidate": net.state_dict(),
+            "best": best_net.state_dict(),
+            "optimizer": optimizer.state_dict(),
+            "torch_rng": torch.get_rng_state(),
+            "cuda_rng": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+            "random_rng": random.getstate(),
+            "numpy_rng": np.random.get_state(),
+            "replay": buffer.state_dict(),
+            "config": _config_snapshot(cfg),
+        }
+        if provenance:
+            payload.update(provenance)
+        tmp = paths["latest"] + ".tmp"
+        torch.save(payload, tmp)
+        os.replace(tmp, paths["latest"])
+        _save_meta(cfg, run_id=run_id, iteration=iteration, generation=generation,
+                   optimizer_steps=optimizer_steps, replay_size=len(buffer),
+                   reason=reason, architecture_id=arch_id, provenance=provenance)
+        # Publish best AFTER latest so best.pt never runs ahead of resumable state.
+        _publish_best(cfg, best_net, run_id=run_id, iteration=iteration,
+                      generation=generation, architecture_id=arch_id)
+    try:
+        ckpt_bytes = None
+        try:
+            ckpt_bytes = os.path.getsize(paths["latest"])
+        except OSError:
+            pass
+        telemetry.safe_emit(cfg, {
+            "type": "phase",
+            "phase": "checkpoint",
+            "run_id": run_id,
+            "iteration": iteration,
+            "generation": generation,
+            "duration_s": _ckpt_timer.duration_s,
+            "snapshot": False,
+            "bytes": ckpt_bytes,
+            "reason": reason,
+        })
+    except Exception:  # noqa: BLE001 - telemetry must never kill training
+        pass
     return paths["latest"]
 
 
@@ -699,19 +743,45 @@ def _archive_latest(cfg):
         print(f"Archived previous latest -> {os.path.basename(archived)}", flush=True)
 
 
-def _snapshot_checkpoint(cfg, iteration):
+def _snapshot_checkpoint(cfg, iteration, *, run_id=None, generation=None):
     """Hardlink the just-written latest.pt to a versioned, never-overwritten
-    filename so checkpoints are countable and recoverable after a reset."""
-    latest_path = _checkpoint_paths(cfg)["latest"]
-    if not os.path.exists(latest_path):
-        return None
-    versioned = os.path.join(
-        cfg.checkpoint_dir, f"ckpt-iter{iteration:04d}-{_timestamp()}.pt"
-    )
+    filename so checkpoints are countable and recoverable after a reset.
+
+    Telemetry (Ticket A): the hardlink runs inside a `PhaseTimer("checkpoint")`
+    and a swallow-guarded `phase` record (snapshot=True) is emitted when a
+    versioned snapshot was actually taken.
+    """
+    with telemetry.PhaseTimer("checkpoint") as _ckpt_timer:
+        latest_path = _checkpoint_paths(cfg)["latest"]
+        if not os.path.exists(latest_path):
+            return None
+        versioned = os.path.join(
+            cfg.checkpoint_dir, f"ckpt-iter{iteration:04d}-{_timestamp()}.pt"
+        )
+        try:
+            os.link(latest_path, versioned)
+        except OSError:
+            shutil.copy2(latest_path, versioned)
     try:
-        os.link(latest_path, versioned)
-    except OSError:
-        shutil.copy2(latest_path, versioned)
+        if versioned is not None:
+            snap_bytes = None
+            try:
+                snap_bytes = os.path.getsize(versioned)
+            except OSError:
+                pass
+            telemetry.safe_emit(cfg, {
+                "type": "phase",
+                "phase": "checkpoint",
+                "run_id": run_id,
+                "iteration": iteration,
+                "generation": generation,
+                "duration_s": _ckpt_timer.duration_s,
+                "snapshot": True,
+                "bytes": snap_bytes,
+                "reason": "iteration",
+            })
+    except Exception:  # noqa: BLE001 - telemetry must never kill training
+        pass
     return versioned
 
 
@@ -774,7 +844,9 @@ def _new_optimizer(cfg, net):
                 weight_decay=getattr(cfg, "weight_decay", 1e-4))
 
 
-def _epoch_train(cfg, net, optimizer, buffer, device, scaler=None):
+def _epoch_train(cfg, net, optimizer, buffer, device, scaler=None, *,
+                 run_id=None, iteration=None, generation=None,
+                 optimizer_steps_total=None):
     """Run `training_epochs` REAL epochs over a bounded, per-epoch-shuffled
     sample from the replay buffer.  Each minibatch is one optimizer step.
 
@@ -785,6 +857,11 @@ def _epoch_train(cfg, net, optimizer, buffer, device, scaler=None):
     the forward/loss run under autocast, the loss is scaled before backward,
     and the optimizer steps through the scaler.  When `scaler` is None or
     disabled (CPU / amp off) the loop is the plain FP32 path.
+
+    Telemetry (Ticket A): the training body runs inside a
+    `PhaseTimer("training")` and a swallow-guarded `phase` record is emitted on
+    exit (`run_id`/`iteration`/`generation`/`optimizer_steps_total` are the
+    loop's running metadata, passed in so the record is complete).
     """
     n = len(buffer)
     epochs = int(getattr(cfg, "training_epochs",
@@ -805,55 +882,81 @@ def _epoch_train(cfg, net, optimizer, buffer, device, scaler=None):
     sum_policy = sum_value = sum_entropy = 0.0
     steps = batches = 0
     amp = scaler is not None and bool(getattr(scaler, "_enabled", False))
-    for _ in range(epochs):
-        # Uniform sample from the entire replay, freshly shuffled each epoch.
-        # Sampling only permutation(sample_size) would repeatedly train the
-        # oldest prefix and starve newly generated positions.
-        rows = np.random.choice(n, size=sample_size, replace=False)
-        for start in range(0, sample_size, cfg.train_batch_size):
-            batch_rows = rows[start:start + cfg.train_batch_size]
-            states, pis, zs = buffer.sample_indices(batch_rows, device)
-            if amp:
-                with torch.autocast(device_type=_device_type(device)):
+    with telemetry.PhaseTimer("training") as _train_timer:
+        for _ in range(epochs):
+            # Uniform sample from the entire replay, freshly shuffled each epoch.
+            # Sampling only permutation(sample_size) would repeatedly train the
+            # oldest prefix and starve newly generated positions.
+            rows = np.random.choice(n, size=sample_size, replace=False)
+            for start in range(0, sample_size, cfg.train_batch_size):
+                batch_rows = rows[start:start + cfg.train_batch_size]
+                states, pis, zs = buffer.sample_indices(batch_rows, device)
+                if amp:
+                    with torch.autocast(device_type=_device_type(device)):
+                        logits, value = net(states)
+                        policy_loss = F.cross_entropy(logits, pis)
+                        value_loss = F.mse_loss(value, zs)
+                        loss = policy_loss + value_loss
+                    optimizer.zero_grad(set_to_none=True)
+                    scaler.scale(loss).backward()
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
                     logits, value = net(states)
                     policy_loss = F.cross_entropy(logits, pis)
                     value_loss = F.mse_loss(value, zs)
                     loss = policy_loss + value_loss
-                optimizer.zero_grad(set_to_none=True)
-                scaler.scale(loss).backward()
-                scaler.step(optimizer)
-                scaler.update()
-            else:
-                logits, value = net(states)
-                policy_loss = F.cross_entropy(logits, pis)
-                value_loss = F.mse_loss(value, zs)
-                loss = policy_loss + value_loss
-                optimizer.zero_grad(set_to_none=True)
-                loss.backward()
-                optimizer.step()
-            probs = F.softmax(logits.float(), dim=1)
-            entropy = -(probs * (probs + 1e-12).log()).sum(dim=1).mean()
-            sum_policy += float(policy_loss.item())
-            sum_value += float(value_loss.item())
-            sum_entropy += float(entropy.item())
-            steps += 1
-            batches += 1
-    return {
+                    optimizer.zero_grad(set_to_none=True)
+                    loss.backward()
+                    optimizer.step()
+                probs = F.softmax(logits.float(), dim=1)
+                entropy = -(probs * (probs + 1e-12).log()).sum(dim=1).mean()
+                sum_policy += float(policy_loss.item())
+                sum_value += float(value_loss.item())
+                sum_entropy += float(entropy.item())
+                steps += 1
+                batches += 1
+    result = {
         "policy_loss": sum_policy / batches,
         "value_loss": sum_value / batches,
         "entropy": sum_entropy / batches,
         "steps": steps,
         "batches": batches,
     }
+    try:
+        telemetry.safe_emit(cfg, {
+            "type": "phase",
+            "phase": "training",
+            "run_id": run_id,
+            "iteration": iteration,
+            "generation": generation,
+            "duration_s": _train_timer.duration_s,
+            "steps": result["steps"],
+            "batches": result["batches"],
+            "train_batch_size": int(getattr(cfg, "train_batch_size", 0)),
+            "policy_loss": result["policy_loss"],
+            "value_loss": result["value_loss"],
+            "entropy": result["entropy"],
+            "optimizer_steps": int((optimizer_steps_total or 0)
+                                   + result["steps"]),
+        })
+    except Exception:  # noqa: BLE001 - telemetry must never kill training
+        pass
+    return result
 
 
-def _arena_gate(cfg, net, best_net):
+def _arena_gate(cfg, net, best_net, *, run_id=None, iteration=None,
+                generation=None):
     """Candidate vs incumbent best.  Standard score = (wins + 0.5*draws)/games.
 
     The arena uses a deterministic paired-opening suite (generated from
     cfg.arena_seed) so results are comparable across evaluations.  Returns
     dict(a, b, draws, games, score, accepted, opening_seed, opening_pairs,
     opening_suite_hash).
+
+    Telemetry (Ticket A): the ``play_match`` call runs inside a
+    `PhaseTimer("arena")` and a swallow-guarded `phase` record with the arena
+    fields is emitted on exit.
     """
     net.eval()
     best_net.eval()
@@ -867,13 +970,35 @@ def _arena_gate(cfg, net, best_net):
     suite_hash = arena_suite_hash(openings)
     # play_match regenerates the same deterministic suite internally (seeded by
     # cfg.arena_seed); the hash above describes exactly that suite.
-    result = play_match(net, best_net, cfg, num_games=cfg.arena_games)
+    with telemetry.PhaseTimer("arena") as _arena_timer:
+        result = play_match(net, best_net, cfg, num_games=cfg.arena_games)
     wins = int(result["a"])
     losses = int(result["b"])
     draws = int(result["draws"])
     games = wins + losses + draws
     score = (wins + 0.5 * draws) / games if games else 0.0
     accepted = score >= float(getattr(cfg, "arena_accept_threshold", 0.55))
+    try:
+        telemetry.safe_emit(cfg, {
+            "type": "phase",
+            "phase": "arena",
+            "run_id": run_id,
+            "iteration": iteration,
+            "generation": generation,
+            "duration_s": _arena_timer.duration_s,
+            "arena_games": games,
+            "arena_sims": int(getattr(cfg, "arena_simulations", 0)),
+            "wins": wins,
+            "draws": draws,
+            "losses": losses,
+            "score": score,
+            "accepted": accepted,
+            "opening_seed": opening_seed,
+            "opening_pairs": num_pairs,
+            "opening_suite_hash": suite_hash,
+        })
+    except Exception:  # noqa: BLE001 - telemetry must never kill training
+        pass
     return {"a": wins, "b": losses, "draws": draws, "games": games,
             "score": score, "accepted": accepted,
             "opening_seed": opening_seed, "opening_pairs": num_pairs,
@@ -1058,17 +1183,36 @@ def run(cfg=None, resume=False, on_iteration=None, warm_start_checkpoint=None):
             # ---- 1. self-play with the ACCEPTED best as teacher ----
             net.eval()
             best_net.eval()
-            for _ in range(cfg.games_per_iteration):
-                buffer.extend(play_game(best_net, cfg))
-                games_played += 1
+            buf_before = len(buffer)
+            with telemetry.PhaseTimer("selfplay") as _sp_timer:
+                for _ in range(cfg.games_per_iteration):
+                    buffer.extend(play_game(best_net, cfg))
+                    games_played += 1
+            try:
+                telemetry.safe_emit(cfg, {
+                    "type": "phase",
+                    "phase": "selfplay",
+                    "run_id": run_id,
+                    "iteration": iteration,
+                    "generation": generation,
+                    "duration_s": _sp_timer.duration_s,
+                    "games": cfg.games_per_iteration,
+                    "examples": len(buffer) - buf_before,
+                })
+            except Exception:  # noqa: BLE001 - telemetry must never kill training
+                pass
 
             # ---- 2. real bounded shuffled epochs ----
-            train_out = _epoch_train(cfg, net, optimizer, buffer, device, scaler)
+            train_out = _epoch_train(cfg, net, optimizer, buffer, device, scaler,
+                                     run_id=run_id, iteration=iteration,
+                                     generation=generation,
+                                     optimizer_steps_total=optimizer_steps)
             optimizer_steps += train_out["steps"]
 
             # ---- 3. arena gate: candidate vs incumbent best ----
             if iteration % int(getattr(cfg, "arena_every", 10)) == 0:
-                outcome = _arena_gate(cfg, net, best_net)
+                outcome = _arena_gate(cfg, net, best_net, run_id=run_id,
+                                      iteration=iteration, generation=generation)
                 if outcome["accepted"]:
                     generation += 1
                     best_net.load_state_dict(net.state_dict())
@@ -1102,7 +1246,8 @@ def run(cfg=None, resume=False, on_iteration=None, warm_start_checkpoint=None):
                          scaler=scaler, device=device, provenance=provenance)
             completed_iteration = iteration
             if iteration % int(getattr(cfg, "checkpoint_every_iterations", 1)) == 0:
-                _snapshot_checkpoint(cfg, iteration)
+                _snapshot_checkpoint(cfg, iteration, run_id=run_id,
+                                     generation=generation)
 
             _log_metrics(cfg, run_id=run_id, iteration=iteration,
                          generation=generation,
@@ -1298,20 +1443,38 @@ def run_parallel(cfg=None, resume=False, num_workers=None, on_iteration=None,
             # live. Games already in progress retain their old tag and are
             # discarded by _collect_games after an arena promotion.
             teacher_generation.value = generation
-            games = _collect_games(
-                cfg, result_queue, procs, cfg.games_per_iteration, stop_event,
-                expected_generation=generation, server=server,
-            )
-            buffer.extend(games)
-            games_played += cfg.games_per_iteration
+            with telemetry.PhaseTimer("selfplay") as _sp_timer:
+                games = _collect_games(
+                    cfg, result_queue, procs, cfg.games_per_iteration, stop_event,
+                    expected_generation=generation, server=server,
+                )
+                buffer.extend(games)
+                games_played += cfg.games_per_iteration
+            try:
+                telemetry.safe_emit(cfg, {
+                    "type": "phase",
+                    "phase": "selfplay",
+                    "run_id": run_id,
+                    "iteration": iteration,
+                    "generation": generation,
+                    "duration_s": _sp_timer.duration_s,
+                    "games": cfg.games_per_iteration,
+                    "examples": len(games),
+                })
+            except Exception:  # noqa: BLE001 - telemetry must never kill training
+                pass
 
             # ---- 2. real bounded shuffled epochs ----
-            train_out = _epoch_train(cfg, net, optimizer, buffer, device, scaler)
+            train_out = _epoch_train(cfg, net, optimizer, buffer, device, scaler,
+                                     run_id=run_id, iteration=iteration,
+                                     generation=generation,
+                                     optimizer_steps_total=optimizer_steps)
             optimizer_steps += train_out["steps"]
 
             # ---- 3. arena gate: candidate vs incumbent best ----
             if iteration % int(getattr(cfg, "arena_every", 10)) == 0:
-                outcome = _arena_gate(cfg, net, best_net)
+                outcome = _arena_gate(cfg, net, best_net, run_id=run_id,
+                                      iteration=iteration, generation=generation)
                 if outcome["accepted"]:
                     generation += 1
                     best_net.load_state_dict(net.state_dict())
@@ -1343,7 +1506,8 @@ def run_parallel(cfg=None, resume=False, num_workers=None, on_iteration=None,
                          scaler=scaler, device=device, provenance=provenance)
             completed_iteration = iteration
             if iteration % int(getattr(cfg, "checkpoint_every_iterations", 1)) == 0:
-                _snapshot_checkpoint(cfg, iteration)
+                _snapshot_checkpoint(cfg, iteration, run_id=run_id,
+                                     generation=generation)
 
             _log_metrics(cfg, run_id=run_id, iteration=iteration,
                          generation=generation,
@@ -1494,6 +1658,9 @@ def run_native(cfg=None, resume=False, on_iteration=None,
     # and read); weights are refreshed from best_net before each self-play
     # round so the actor always plays the accepted incumbent.
     inference_fn = native_selfplay.make_gpu_inference_fn(cfg)
+    # Telemetry classification for shared phase records (design §2.1 backend);
+    # informational only — never changes training semantics.
+    cfg.backend = "native"
 
     games_played = (start_iteration - 1) * cfg.games_per_iteration
     num_iterations = int(getattr(cfg, "num_iterations", 1))
@@ -1519,17 +1686,49 @@ def run_native(cfg=None, resume=False, on_iteration=None,
                 weight_version=optimizer_steps,  # monotonically increases
                 generation=generation,
                 seed=round_seed,
+                run_id=run_id,
+                iteration=iteration,
             )
-            buffer.extend(sp.run())
+            with telemetry.PhaseTimer("selfplay") as _sp_timer:
+                sp_examples = sp.run()
+            buffer.extend(sp_examples)
             games_played += cfg.games_per_iteration
+            try:
+                _gstats = _gpu_stats(inference_fn)
+                telemetry.safe_emit(cfg, {
+                    "type": "phase",
+                    "phase": "selfplay",
+                    "run_id": run_id,
+                    "iteration": iteration,
+                    "generation": generation,
+                    "duration_s": _sp_timer.duration_s,
+                    "games": cfg.games_per_iteration,
+                    "examples": len(sp_examples),
+                    "inference_calls": sp.inference_calls,
+                    **sp.batch_stats,
+                    "simulations": sp.simulations,
+                    "sims_per_s": (sp.simulations / _sp_timer.duration_s)
+                                  if _sp_timer.duration_s > 0 else None,
+                    "games_per_hour": (
+                        cfg.games_per_iteration * 3600.0 / _sp_timer.duration_s
+                    ) if _sp_timer.duration_s > 0 else None,
+                    "round_seed": round_seed,
+                    **{f"gpu_{k}": v for k, v in _gstats.items()},
+                })
+            except Exception:  # noqa: BLE001 - telemetry must never kill training
+                pass
 
             # ---- 2. real bounded shuffled epochs ----
-            train_out = _epoch_train(cfg, net, optimizer, buffer, device, scaler)
+            train_out = _epoch_train(cfg, net, optimizer, buffer, device, scaler,
+                                     run_id=run_id, iteration=iteration,
+                                     generation=generation,
+                                     optimizer_steps_total=optimizer_steps)
             optimizer_steps += train_out["steps"]
 
             # ---- 3. arena gate: candidate vs incumbent best ----
             if iteration % int(getattr(cfg, "arena_every", 10)) == 0:
-                outcome = _arena_gate(cfg, net, best_net)
+                outcome = _arena_gate(cfg, net, best_net, run_id=run_id,
+                                      iteration=iteration, generation=generation)
                 if outcome["accepted"]:
                     generation += 1
                     best_net.load_state_dict(net.state_dict())
@@ -1561,7 +1760,8 @@ def run_native(cfg=None, resume=False, on_iteration=None,
                          scaler=scaler, device=device, provenance=provenance)
             completed_iteration = iteration
             if iteration % int(getattr(cfg, "checkpoint_every_iterations", 1)) == 0:
-                _snapshot_checkpoint(cfg, iteration)
+                _snapshot_checkpoint(cfg, iteration, run_id=run_id,
+                                     generation=generation)
 
             _log_metrics(cfg, run_id=run_id, iteration=iteration,
                          generation=generation,
@@ -1571,6 +1771,36 @@ def run_native(cfg=None, resume=False, on_iteration=None,
                          optimizer_steps=optimizer_steps,
                          replay_size=len(buffer), games=games_played,
                          round_seed=round_seed)
+
+            # ---- 5. telemetry: resource + (on cadence) replay diversity ----
+            resource_every = max(
+                1, int(getattr(cfg, "telemetry_resource_every", 1))
+            )
+            if iteration % resource_every == 0:
+                try:
+                    _rec = {"type": "resource",
+                            "run_id": run_id,
+                            "iteration": iteration,
+                            "generation": generation}
+                    _rec.update(telemetry.sample_resources())
+                    _rec.update({f"gpu_{k}": v
+                                 for k, v in _gpu_stats(inference_fn).items()})
+                    telemetry.safe_emit(cfg, _rec)
+                except Exception:  # noqa: BLE001 - telemetry must never kill training
+                    pass
+            diversity_every = int(getattr(cfg, "telemetry_diversity_every", None)
+                                  or getattr(cfg, "arena_every", 10))
+            if diversity_every > 0 and iteration % diversity_every == 0:
+                try:
+                    _rec = {"type": "diversity",
+                            "source": "replay_buffer",
+                            "run_id": run_id,
+                            "iteration": iteration,
+                            "generation": generation}
+                    _rec.update(telemetry.replay_diversity(buffer))
+                    telemetry.safe_emit(cfg, _rec)
+                except Exception:  # noqa: BLE001 - telemetry must never kill training
+                    pass
             print(
                 f"iter {iteration:4d}  gen {generation}  steps {optimizer_steps}"
                 f"  buffer {len(buffer)}  "

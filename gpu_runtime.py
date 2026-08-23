@@ -42,7 +42,9 @@ The runtime is NOT thread-safe: callers must serialize access.
 
 from __future__ import annotations
 
+import time
 import warnings
+from collections import deque
 from dataclasses import dataclass, field
 from typing import Optional, Tuple
 
@@ -165,6 +167,15 @@ class InferenceRuntime:
         # ---- dedicated copy streams (H2D in, D2H out) ---- #
         self.stream_h2d = torch.cuda.Stream(device=self.device)
         self.stream_d2h = torch.cuda.Stream(device=self.device)
+
+        # ---- telemetry counters (Ticket A; per-instance, semantic-free) ----
+        # ``call_count`` / ``batch_b`` / ``total_forward_s`` are purely
+        # additive counters around ``evaluate`` — no tensor/RNG/order change.
+        # ``stats()`` computes the batch distribution from the deque at read
+        # time (cheap at 10k elements).
+        self.call_count = 0
+        self.batch_b: deque = deque(maxlen=10_000)
+        self.total_forward_s = 0.0
 
         # ---- per-bucket preallocated pinned host + device buffers ---- #
         self._pinned: dict[int, dict[str, torch.Tensor]] = {}
@@ -408,9 +419,44 @@ class InferenceRuntime:
 
         Returns ``(legal_logits[K] f32, values[B,1] f32)``.
         """
+        t0 = time.perf_counter()
         call = self.prepare(inputs, offsets, indices)
         legal, values = self.forward_device(call)
-        return self.copy_back(call, legal, values)
+        out = self.copy_back(call, legal, values)
+        self.total_forward_s += time.perf_counter() - t0
+        self.call_count += 1
+        self.batch_b.append(call.B)
+        return out
+
+    def stats(self) -> dict:
+        """Canonical inference counters (Ticket A, design §3.3).
+
+        Returns ``{"calls", "batch_min", "batch_mean", "batch_p50",
+        "batch_p90", "batch_max", "total_forward_s"}`` with the batch
+        distribution computed from the ``batch_b`` deque at read time (the
+        batch percentiles are ``None`` before the first successful call).
+        """
+        batch = list(self.batch_b)
+        if batch:
+            arr = np.asarray(batch, dtype=np.float64)
+            return {
+                "calls": int(self.call_count),
+                "batch_min": float(arr.min()),
+                "batch_mean": float(arr.mean()),
+                "batch_p50": float(np.percentile(arr, 50)),
+                "batch_p90": float(np.percentile(arr, 90)),
+                "batch_max": float(arr.max()),
+                "total_forward_s": float(self.total_forward_s),
+            }
+        return {
+            "calls": int(self.call_count),
+            "batch_min": None,
+            "batch_mean": None,
+            "batch_p50": None,
+            "batch_p90": None,
+            "batch_max": None,
+            "total_forward_s": float(self.total_forward_s),
+        }
 
     def close(self) -> None:
         """Restore global cudnn determinism flags (buffers stay valid)."""

@@ -88,6 +88,15 @@ class Config:
     arena_seed = 424242
     arena_opening_plies = 8
 
+    # ---- permanent phase telemetry (Ticket A; see docs/telemetry-design.md) ----
+    # Swallow-guarded + semantic-free, so leaving it on is safe: no extra
+    # forward passes, no RNG draws, no data mutation — replay examples, move
+    # choices, checkpoints and scores are bit-identical with it on vs off.
+    telemetry_enabled = True          # global on/off for the JSONL emitter
+    telemetry_path = None             # None -> <checkpoint_dir>/telemetry.jsonl
+    telemetry_resource_every = 1      # emit a `resource` record every N iterations
+    telemetry_diversity_every = arena_every  # replay-buffer diversity audit cadence
+
     # ---- misc ----
     max_game_length = 400       # plies hard cap -> draw
     checkpoint_every_iterations = 20    # completed iterations between snapshots
