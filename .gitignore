@@ -16,3 +16,6 @@ evidence/
 
 # Hermes agent workspace (plans, session artifacts)
 .hermes/
+
+# arena benchmark telemetry run artifacts
+benchmarks/results/arena-telemetry-*.jsonl
