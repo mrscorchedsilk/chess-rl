@@ -93,6 +93,7 @@ class Controller:
         self.run_id = None
         self.returncode = None
         self.error = None
+        self.checkpoint_dir = None   # active run's checkpoint dir (else default)
 
     # -- internals ---------------------------------------------------------- #
 
@@ -118,7 +119,8 @@ class Controller:
 
     def start(self, workers=8, resume=True, backend="python",
               num_simulations=None, games_per_iteration=None,
-              num_iterations=None, arena_every=None):
+              num_iterations=None, arena_every=None,
+              warm_start_checkpoint=None, checkpoint_dir=None):
         with self.lock:
             self._reap()
             if self.proc is not None:
@@ -129,8 +131,14 @@ class Controller:
                 cmd = [PYTHON, TRAIN_SCRIPT, "--selfplay-backend", "native"]
             else:
                 cmd = [PYTHON, TRAIN_SCRIPT, "--workers", str(workers)]
-            if resume:
+            if warm_start_checkpoint is not None:
+                # Weights-only warm start (new lineage): mutually exclusive with
+                # --resume, so it suppresses the resume flag below.
+                cmd += ["--warm-start-checkpoint", str(warm_start_checkpoint)]
+            elif resume:
                 cmd.append("--resume")
+            if checkpoint_dir is not None:
+                cmd += ["--checkpoint-dir", str(checkpoint_dir)]
             if num_simulations is not None:
                 cmd += ["--num-simulations", str(int(num_simulations))]
             if games_per_iteration is not None:
@@ -166,6 +174,7 @@ class Controller:
             self.workers = workers
             self.resume = resume
             self.backend = backend
+            self.checkpoint_dir = checkpoint_dir
             self.run_id = "run-%d-%d" % (self.proc.pid, int(self.started_at))
             return {"ok": True, "pid": self.proc.pid, "workers": workers,
                     "resume": resume, "backend": backend,
@@ -379,14 +388,20 @@ def _read_resources():
     return out
 
 
+def _active_checkpoint_dir():
+    """The ACTIVE run's checkpoint dir (set by start()), else the default."""
+    return getattr(CTRL, "checkpoint_dir", None) or CHECKPOINT_DIR
+
+
 def _checkpoint_info():
     """Honest checkpoint inventory: best/latest existence + versioned counts."""
     info = {"any": False, "best": False, "latest": False,
             "versioned_snapshots": 0, "archived_best": 0}
-    if not os.path.isdir(CHECKPOINT_DIR):
+    ck_dir = _active_checkpoint_dir()
+    if not os.path.isdir(ck_dir):
         return info
     try:
-        files = os.listdir(CHECKPOINT_DIR)
+        files = os.listdir(ck_dir)
     except Exception:
         return info
     snapshots = [f for f in files if re.match(r"^ckpt-iter\d+-.*\.pt$", f)]
@@ -412,7 +427,7 @@ def _checkpoint_meta():
     Read as plain JSON — NEVER torch.load: latest.pt may embed a huge replay
     buffer and must not be touched on the status polling path.
     """
-    path = os.path.join(CHECKPOINT_DIR, "checkpoint_meta.json")
+    path = os.path.join(_active_checkpoint_dir(), "checkpoint_meta.json")
     try:
         with open(path) as f:
             meta = json.load(f)
@@ -433,7 +448,7 @@ def _saved_iteration(recs, meta):
         return int(si)
     best = -1
     try:
-        for f in os.listdir(CHECKPOINT_DIR):
+        for f in os.listdir(_active_checkpoint_dir()):
             m = re.match(r"^ckpt-iter(\d+)-", f)
             if m:
                 best = max(best, int(m.group(1)))
@@ -645,12 +660,21 @@ class Handler(BaseHTTPRequestHandler):
                 except (TypeError, ValueError):
                     return None
 
+            warm_start_checkpoint = data.get("warm_start_checkpoint")
+            checkpoint_dir = data.get("checkpoint_dir")
+            if warm_start_checkpoint is not None and not isinstance(warm_start_checkpoint, str):
+                return self._json({"error": "warm_start_checkpoint must be a string"}, 400)
+            if checkpoint_dir is not None and not isinstance(checkpoint_dir, str):
+                return self._json({"error": "checkpoint_dir must be a string"}, 400)
+
             result = CTRL.start(
                 workers=workers, resume=resume, backend=backend,
                 num_simulations=_opt_int("num_simulations"),
                 games_per_iteration=_opt_int("games_per_iteration"),
                 num_iterations=_opt_int("num_iterations"),
                 arena_every=_opt_int("arena_every"),
+                warm_start_checkpoint=warm_start_checkpoint,
+                checkpoint_dir=checkpoint_dir,
             )
         elif action == "stop":
             result = CTRL.stop()

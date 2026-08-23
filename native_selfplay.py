@@ -28,6 +28,31 @@ InferenceFn = Callable[
     [np.ndarray, np.ndarray, np.ndarray], Tuple[np.ndarray, np.ndarray]
 ]
 
+# SplitMix64 constants (mirror native/actor.cpp::derive_seed) so a round seed
+# derived in Python matches the C++ per-game seed derivation exactly.
+_MASK64 = (1 << 64) - 1
+_GOLDEN = 0x9E3779B97F4A7C15
+_MIX1 = 0xBF58476D1CE4E5B9
+_MIX2 = 0x94D049BB133111EB
+
+
+def derive_selfplay_seed(base_seed: int, iteration: int) -> int:
+    """Stable unsigned 64-bit self-play round seed from ``(base_seed, iteration)``.
+
+    A SplitMix64-style finaliser, mirroring the native Actor's own per-game
+    seed derivation.  The result depends ONLY on the two integer inputs — never
+    Python ``hash()``, the process id, wall-clock time, or ``optimizer_steps``
+    (which resets after arena rejection) — so an uninterrupted run and a
+    resumed run that both reach the same completed-iteration boundary derive
+    the exact same round seed, while adjacent iterations always differ.
+    """
+    base = int(base_seed) & _MASK64
+    it = int(iteration) & _MASK64
+    x = (base + it + _GOLDEN) & _MASK64
+    x = ((x ^ (x >> 30)) * _MIX1) & _MASK64
+    x = ((x ^ (x >> 27)) * _MIX2) & _MASK64
+    return (x ^ (x >> 31)) & _MASK64
+
 
 class NativeSelfPlay:
     """Runs self-play games with the native Actor + an injected inference fn.
@@ -44,12 +69,19 @@ class NativeSelfPlay:
         games: Optional[int] = None,
         weight_version: int = 0,
         generation: int = 0,
+        seed: Optional[int] = None,
     ):
         self.cfg = cfg
         self.inference_fn = inference_fn
         self.games = int(games if games is not None else cfg.games_per_iteration)
         self.weight_version = int(weight_version)
         self.generation = int(generation)
+        # One explicit base seed per self-play ROUND.  The trainer derives this
+        # from (cfg.seed, iteration) via derive_selfplay_seed so each iteration
+        # plays genuinely new games; the C++ Actor then derives distinct
+        # per-game seeds from it.  cfg.seed is NEVER mutated here.
+        actor_seed = int(seed) if seed is not None else int(cfg.seed)
+        self.round_seed = actor_seed
         self.actor = native.Actor(
             games=self.games,
             c_puct=float(cfg.c_puct),
@@ -58,7 +90,7 @@ class NativeSelfPlay:
             temperature=float(cfg.temperature),
             temperature_threshold=int(cfg.temperature_threshold),
             max_game_length=int(cfg.max_game_length),
-            seed=int(cfg.seed),
+            seed=actor_seed,
             num_threads=self.games,
         )
         self.actor.set_teacher(self.weight_version, self.generation)

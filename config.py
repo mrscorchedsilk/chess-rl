@@ -80,6 +80,13 @@ class Config:
     arena_games = 20
     arena_accept_threshold = 0.55
     arena_root_noise = False    # arena matches use NO Dirichlet root exploration
+    # Paired-opening diversity: arena games start from `arena_games // 2`
+    # distinct deterministic openings (generated from `arena_seed`), each
+    # played twice with colors swapped.  Independent of weights / global RNG /
+    # self-play seed; bounded shallow depth keeps arena games non-trivial but
+    # varied.  Temperature stays 0 and root noise stays off.
+    arena_seed = 424242
+    arena_opening_plies = 8
 
     # ---- misc ----
     max_game_length = 400       # plies hard cap -> draw

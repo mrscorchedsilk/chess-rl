@@ -191,6 +191,32 @@ def test_start_records_error_when_spawn_fails(ctrl, monkeypatch):
     assert "no such interpreter" in ctrl.error
 
 
+def test_start_warm_start_and_checkpoint_dir(ctrl, tmp_path, monkeypatch):
+    write_fake_train(tmp_path, "import sys\nsys.exit(0)\n")
+    recorded = []
+    real_popen = subprocess.Popen
+
+    def rec(cmd, **kw):
+        recorded.append(cmd)
+        return real_popen(cmd, **kw)
+
+    monkeypatch.setattr(ts.subprocess, "Popen", rec)
+    try:
+        r = ctrl.start(backend="native", resume=True,
+                       warm_start_checkpoint="/x/src.pt", checkpoint_dir="/x/dst")
+        assert r["ok"]
+        cmd = recorded[0]
+        assert "--selfplay-backend" in cmd and "native" in cmd
+        assert "--warm-start-checkpoint" in cmd
+        assert "/x/src.pt" in cmd
+        assert "--checkpoint-dir" in cmd
+        assert "/x/dst" in cmd
+        # warm-start must suppress the default --resume
+        assert "--resume" not in cmd
+    finally:
+        ctrl.stop()
+
+
 # --------------------------------------------------------------------------- #
 #  controller: return code / error tracking                                   #
 # --------------------------------------------------------------------------- #
@@ -334,6 +360,25 @@ def test_checkpoint_meta_missing_falls_back_gracefully(ctrl, tmp_path):
 # --------------------------------------------------------------------------- #
 #  checkpoints: honest counts, no misleading '0 checkpoints'                   #
 # --------------------------------------------------------------------------- #
+
+def test_checkpoint_telemetry_follows_active_checkpoint_dir(ctrl, tmp_path):
+    """checkpoint telemetry must read the ACTIVE run's checkpoint_dir (set by
+    start()), falling back to CHECKPOINT_DIR when none is active."""
+    custom = tmp_path / "custom"
+    custom.mkdir()
+    with open(custom / "checkpoint_meta.json", "w") as f:
+        json.dump({"iteration": 42, "run_id": "run-X", "generation": 2}, f)
+    (custom / "best.pt").touch()
+
+    # no active checkpoint_dir -> falls back to the (monkeypatched) default
+    ctrl.checkpoint_dir = None
+    assert ts._checkpoint_meta() == {}
+
+    # active checkpoint_dir -> telemetry reads it
+    ctrl.checkpoint_dir = str(custom)
+    assert ts._checkpoint_meta()["iteration"] == 42
+    assert ts._checkpoint_info()["best"] is True
+
 
 def test_checkpoint_info_not_misleading(ctrl, tmp_path):
     ck = ts._checkpoint_info()
