@@ -946,13 +946,20 @@ def _epoch_train(cfg, net, optimizer, buffer, device, scaler=None, *,
 
 
 def _arena_gate(cfg, net, best_net, *, run_id=None, iteration=None,
-                generation=None):
+                generation=None, arena_engine=None):
     """Candidate vs incumbent best.  Standard score = (wins + 0.5*draws)/games.
 
     The arena uses a deterministic paired-opening suite (generated from
     cfg.arena_seed) so results are comparable across evaluations.  Returns
     dict(a, b, draws, games, score, accepted, opening_seed, opening_pairs,
     opening_suite_hash).
+
+    `arena_engine` (optional, native backend): a persistent
+    `native_arena.NativeArenaEngine` whose `play_match` takes state_dict copies
+    of the candidate/champion nets and the ALREADY-generated `openings` (so the
+    suite hashed below is guaranteed to be the one played).  When None, the
+    python `arena.play_match` path is used with the same `openings` passed
+    through.
 
     Telemetry (Ticket A): the ``play_match`` call runs inside a
     `PhaseTimer("arena")` and a swallow-guarded `phase` record with the arena
@@ -968,10 +975,16 @@ def _arena_gate(cfg, net, best_net, *, run_id=None, iteration=None,
         opening_seed,
     )
     suite_hash = arena_suite_hash(openings)
-    # play_match regenerates the same deterministic suite internally (seeded by
-    # cfg.arena_seed); the hash above describes exactly that suite.
+    # The already-generated suite is passed through so the hash above is
+    # GUARANTEED to describe the suite actually played (no regenerate-and-hope).
     with telemetry.PhaseTimer("arena") as _arena_timer:
-        result = play_match(net, best_net, cfg, num_games=cfg.arena_games)
+        if arena_engine is not None:
+            result = arena_engine.play_match(
+                net.state_dict(), best_net.state_dict(),
+                num_games=cfg.arena_games, openings=openings)
+        else:
+            result = play_match(net, best_net, cfg,
+                                num_games=cfg.arena_games, openings=openings)
     wins = int(result["a"])
     losses = int(result["b"])
     draws = int(result["draws"])
@@ -1662,6 +1675,16 @@ def run_native(cfg=None, resume=False, on_iteration=None,
     # informational only — never changes training semantics.
     cfg.backend = "native"
 
+    # Persistent native-arena engine (optional): two InferenceRuntimes
+    # (candidate + champion) built ONCE per run so torch.compile is paid once;
+    # weights are refreshed per arena gate via state_dict copies.  Only
+    # constructed when the arena_backend flag opts in (default "python" keeps
+    # the python arena path).
+    arena_engine = None
+    if getattr(cfg, "arena_backend", "python") == "native":
+        import native_arena
+        arena_engine = native_arena.NativeArenaEngine(cfg)
+
     games_played = (start_iteration - 1) * cfg.games_per_iteration
     num_iterations = int(getattr(cfg, "num_iterations", 1))
     iteration = start_iteration - 1
@@ -1728,7 +1751,8 @@ def run_native(cfg=None, resume=False, on_iteration=None,
             # ---- 3. arena gate: candidate vs incumbent best ----
             if iteration % int(getattr(cfg, "arena_every", 10)) == 0:
                 outcome = _arena_gate(cfg, net, best_net, run_id=run_id,
-                                      iteration=iteration, generation=generation)
+                                      iteration=iteration, generation=generation,
+                                      arena_engine=arena_engine)
                 if outcome["accepted"]:
                     generation += 1
                     best_net.load_state_dict(net.state_dict())

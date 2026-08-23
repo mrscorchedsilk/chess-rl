@@ -115,7 +115,8 @@ def make_fake_selfplay(monkeypatch, examples_factory):
 
 def make_fake_arena(monkeypatch, result):
     monkeypatch.setattr(train, "play_match",
-                        lambda net_a, net_b, cfg, num_games: dict(result))
+                        lambda net_a, net_b, cfg, num_games, openings=None:
+                        dict(result))
 
 
 def state_dicts_equal(a, b):

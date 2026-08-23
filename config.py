@@ -87,6 +87,11 @@ class Config:
     # varied.  Temperature stays 0 and root noise stays off.
     arena_seed = 424242
     arena_opening_plies = 8
+    # Search backend for the arena gate: "python" (arena.py + mcts.py,
+    # unchanged default) or "native" (native_arena.py + chess_rl_native.MCTS;
+    # see docs/native-arena-design.md).  Game semantics (paired openings,
+    # color swap, temp 0, no root noise, score/threshold) are identical.
+    arena_backend = "python"
 
     # ---- permanent phase telemetry (Ticket A; see docs/telemetry-design.md) ----
     # Swallow-guarded + semantic-free, so leaving it on is safe: no extra

@@ -181,7 +181,7 @@ def test_emit_failure_does_not_abort_run_native(tmp_path, monkeypatch):
                         _stub_inference)
     # Force the arena gate + checkpoint snapshot so every emit path is hit.
     monkeypatch.setattr(train, "play_match",
-                        lambda a, b, cfg_, num_games: {"a": 1, "b": 1, "draws": 0})
+                        lambda a, b, cfg_, num_games, openings=None: {"a": 1, "b": 1, "draws": 0})
 
     train.run_native(cfg, resume=False)  # must complete without raising
 
@@ -242,7 +242,7 @@ def test_run_native_emits_schema_conformant_records(tmp_path, monkeypatch):
     monkeypatch.setattr(train.native_selfplay, "make_gpu_inference_fn",
                         _stub_inference)
     monkeypatch.setattr(train, "play_match",
-                        lambda a, b, cfg_, num_games: {"a": 0, "b": 2, "draws": 0})
+                        lambda a, b, cfg_, num_games, openings=None: {"a": 0, "b": 2, "draws": 0})
 
     train.run_native(cfg, resume=False)
 
@@ -560,7 +560,7 @@ def test_run_native_merges_gpu_runtime_stats(tmp_path, monkeypatch):
     monkeypatch.setattr(train.native_selfplay, "make_gpu_inference_fn",
                         _stub_with_runtime)
     monkeypatch.setattr(train, "play_match",
-                        lambda a, b, cfg_, num_games: {"a": 0, "b": 2, "draws": 0})
+                        lambda a, b, cfg_, num_games, openings=None: {"a": 0, "b": 2, "draws": 0})
 
     train.run_native(cfg, resume=False)
 

@@ -80,7 +80,7 @@ def test_acceptance_writes_immutable_milestone(tmp_path, monkeypatch):
                         lambda net, cfg: [tuple(e) for e in examples])
     # score 1.0 (2 wins, 0 losses, 0 draws) -> accepted
     monkeypatch.setattr(train, "play_match",
-                        lambda a, b, cfg, num_games:
+                        lambda a, b, cfg, num_games, openings=None:
                         {"a": 2, "b": 0, "draws": 0})
 
     train.run(cfg, resume=False)
@@ -122,7 +122,7 @@ def test_rejection_writes_no_milestone(tmp_path, monkeypatch):
                         lambda net, cfg: [tuple(e) for e in examples])
     # score 0.0 (2 losses) -> rejected at every arena gate
     monkeypatch.setattr(train, "play_match",
-                        lambda a, b, cfg, num_games:
+                        lambda a, b, cfg, num_games, openings=None:
                         {"a": 0, "b": 2, "draws": 0})
 
     train.run(cfg, resume=False)
@@ -139,7 +139,7 @@ def test_each_promotion_is_a_distinct_milestone(tmp_path, monkeypatch):
     monkeypatch.setattr(train, "play_game",
                         lambda net, cfg: [tuple(e) for e in examples])
     monkeypatch.setattr(train, "play_match",
-                        lambda a, b, cfg, num_games:
+                        lambda a, b, cfg, num_games, openings=None:
                         {"a": 2, "b": 0, "draws": 0})  # always accepted
 
     train.run(cfg, resume=False)

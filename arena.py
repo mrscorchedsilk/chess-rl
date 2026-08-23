@@ -135,6 +135,10 @@ def play_match(net_a, net_b, cfg, num_games, openings=None):
     nets face every opening from both sides.  Returns
     {'a': wins_a, 'b': wins_b, 'draws': draws}, unchanged.
     """
+    if getattr(cfg, "arena_backend", "python") == "native":
+        from native_arena import play_match as _native_play_match
+        return _native_play_match(net_a, net_b, cfg, num_games, openings)
+    # ---- existing python path, unchanged from here on ----
     if num_games % 2 != 0:
         raise ValueError(f"arena_games must be even (got {num_games})")
     mcts_a = MCTS(net_a, cfg)
