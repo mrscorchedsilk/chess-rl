@@ -63,7 +63,7 @@ import torch.nn.functional as F
 from config import Config
 from model import ChessNet
 from selfplay import play_game
-from arena import play_match
+from arena import play_match, generate_arena_openings, arena_suite_hash
 from parallel import InferenceServer, worker_loop
 from replay import ReplayBuffer, PinnedReplayLoader
 import native_selfplay
@@ -105,8 +105,14 @@ def _metrics_path(cfg):
 
 
 def _log_metrics(cfg, *, run_id, iteration, generation, policy_loss,
-                 value_loss, entropy, optimizer_steps, replay_size, games):
-    """Append one iteration record to the metrics file (machine-readable)."""
+                 value_loss, entropy, optimizer_steps, replay_size, games,
+                 round_seed=None):
+    """Append one iteration record to the metrics file (machine-readable).
+
+    ``round_seed`` (the derived self-play round seed, native backend only) is
+    an OPTIONAL extra field: absent from the python/parallel paths, ignored by
+    legacy readers.
+    """
     try:
         rec = {
             "t": time.time(),
@@ -120,6 +126,8 @@ def _log_metrics(cfg, *, run_id, iteration, generation, policy_loss,
             "replay_size": int(replay_size),
             "games": int(games),
         }
+        if round_seed is not None:
+            rec["round_seed"] = int(round_seed)
         with open(_metrics_path(cfg), "a") as f:
             f.write(json.dumps(rec) + "\n")
     except Exception:  # noqa: BLE001 - observability must never kill training
@@ -127,8 +135,14 @@ def _log_metrics(cfg, *, run_id, iteration, generation, policy_loss,
 
 
 def _log_arena_event(cfg, *, run_id, iteration, generation, wins, draws,
-                     losses, score, accepted):
-    """Append one event-only arena record (never folded into iteration metrics)."""
+                     losses, score, accepted, opening_seed=None,
+                     opening_pairs=None, opening_suite_hash=None):
+    """Append one event-only arena record (never folded into iteration metrics).
+
+    ``opening_seed`` / ``opening_pairs`` / ``opening_suite_hash`` describe the
+    deterministic paired-opening suite used for this arena event and are
+    OPTIONAL extra fields (ignored by legacy readers).
+    """
     try:
         rec = {
             "t": time.time(),
@@ -142,6 +156,12 @@ def _log_arena_event(cfg, *, run_id, iteration, generation, wins, draws,
             "score": round(float(score), 6),
             "accepted": bool(accepted),
         }
+        if opening_seed is not None:
+            rec["opening_seed"] = int(opening_seed)
+        if opening_pairs is not None:
+            rec["opening_pairs"] = int(opening_pairs)
+        if opening_suite_hash is not None:
+            rec["opening_suite_hash"] = str(opening_suite_hash)
         with open(_metrics_path(cfg), "a") as f:
             f.write(json.dumps(rec) + "\n")
     except Exception:  # noqa: BLE001
@@ -288,7 +308,7 @@ def _publish_best(cfg, net, *, run_id=None, iteration=None, generation=None,
 
 
 def _save_meta(cfg, *, run_id, iteration, generation, optimizer_steps,
-               replay_size, reason, architecture_id=None):
+               replay_size, reason, architecture_id=None, provenance=None):
     """Atomically write checkpoint_meta.json next to latest.pt."""
     paths = _checkpoint_paths(cfg)
     meta = {
@@ -304,6 +324,8 @@ def _save_meta(cfg, *, run_id, iteration, generation, optimizer_steps,
         "architecture_id": architecture_id,
         "config": _config_snapshot(cfg),
     }
+    if provenance:
+        meta.update(provenance)
     tmp = paths["meta"] + ".tmp"
     with open(tmp, "w") as f:
         json.dump(meta, f, indent=2, sort_keys=True)
@@ -329,7 +351,7 @@ def _mark_checkpoint_reason(cfg, reason):
 
 def _save_latest(cfg, *, run_id, iteration, generation, optimizer_steps,
                  net, best_net, optimizer, buffer, reason, scaler=None,
-                 device=None):
+                 device=None, provenance=None):
     """Persist a full resumable schema-v3 snapshot (atomic) plus
     checkpoint_meta.json (atomic), then transactionally publish the best pair.
 
@@ -371,12 +393,14 @@ def _save_latest(cfg, *, run_id, iteration, generation, optimizer_steps,
         "replay": buffer.state_dict(),
         "config": _config_snapshot(cfg),
     }
+    if provenance:
+        payload.update(provenance)
     tmp = paths["latest"] + ".tmp"
     torch.save(payload, tmp)
     os.replace(tmp, paths["latest"])
     _save_meta(cfg, run_id=run_id, iteration=iteration, generation=generation,
                optimizer_steps=optimizer_steps, replay_size=len(buffer),
-               reason=reason, architecture_id=arch_id)
+               reason=reason, architecture_id=arch_id, provenance=provenance)
     # Publish best AFTER latest so best.pt never runs ahead of resumable state.
     _publish_best(cfg, best_net, run_id=run_id, iteration=iteration,
                   generation=generation, architecture_id=arch_id)
@@ -536,6 +560,76 @@ def _load_latest_v2(cfg):
         )
     _validate_checkpoint_compat(cfg, payload)
     return payload
+
+
+def _load_warm_start(cfg, path):
+    """Load ONLY the accepted-best weights + provenance from a compatible
+    schema-v3 checkpoint, for a weights-only warm start (new training lineage).
+
+    Validates schema, checkpoint_format, architecture_id, tensor sizes and the
+    state-dict body BEFORE any load_state_dict.  Does NOT return (and the
+    caller must not load) replay, optimizer, GradScaler, RNG state, run_id or
+    the source iteration counter.  Raises IncompatibleCheckpointError on any
+    mismatch.
+    """
+    from model import infer_state_dict_architecture_id, resolve_architecture_id
+
+    if not os.path.exists(path):
+        raise IncompatibleCheckpointError(f"warm-start checkpoint not found: {path}")
+    payload = torch.load(path, map_location="cpu", weights_only=False)
+    version = payload.get("schema_version")
+    if version != CHECKPOINT_SCHEMA_VERSION:
+        raise IncompatibleCheckpointError(
+            f"warm-start checkpoint {path} has schema_version={version!r}; "
+            f"expected {CHECKPOINT_SCHEMA_VERSION}. Refusing warm start."
+        )
+    if payload.get("checkpoint_format") != CHECKPOINT_FORMAT_V3:
+        raise IncompatibleCheckpointError(
+            f"warm-start checkpoint {path} is not schema-v3 "
+            f"(checkpoint_format={payload.get('checkpoint_format')!r}); "
+            "refusing unvalidated warm start."
+        )
+    expected_arch = resolve_architecture_id(
+        int(getattr(cfg, "num_res_blocks", 6)),
+        int(getattr(cfg, "num_filters", 128)),
+    )
+    payload_arch = payload.get("architecture_id")
+    if payload_arch != expected_arch:
+        raise IncompatibleCheckpointError(
+            f"architecture_id mismatch: warm-start checkpoint {path} was "
+            f"trained with {payload_arch!r} but this config builds "
+            f"{expected_arch!r}. Refusing warm start."
+        )
+    if payload.get("policy_size") != getattr(cfg, "policy_size", None):
+        raise IncompatibleCheckpointError(
+            f"policy_size mismatch in warm-start checkpoint {path}"
+        )
+    if payload.get("num_input_planes") != getattr(cfg, "num_input_planes", None):
+        raise IncompatibleCheckpointError(
+            f"num_input_planes mismatch in warm-start checkpoint {path}"
+        )
+    if payload.get("board_size") != getattr(cfg, "board_size", None):
+        raise IncompatibleCheckpointError(
+            f"board_size mismatch in warm-start checkpoint {path}"
+        )
+    best_sd = payload.get("best")
+    if not isinstance(best_sd, dict):
+        raise IncompatibleCheckpointError(
+            f"warm-start checkpoint {path} has no accepted-best state_dict"
+        )
+    inferred = infer_state_dict_architecture_id(best_sd)
+    if inferred != expected_arch:
+        raise IncompatibleCheckpointError(
+            f"warm-start checkpoint {path} best body is {inferred!r} but this "
+            f"config builds {expected_arch!r}. Refusing warm start."
+        )
+    return {
+        "best": best_sd,
+        "parent_run_id": payload.get("run_id"),
+        "parent_iteration": payload.get("iteration"),
+        "parent_generation": payload.get("generation"),
+        "warm_started_from": os.path.abspath(path),
+    }
 
 
 def _restore_rng(state):
@@ -706,10 +800,23 @@ def _epoch_train(cfg, net, optimizer, buffer, device, scaler=None):
 def _arena_gate(cfg, net, best_net):
     """Candidate vs incumbent best.  Standard score = (wins + 0.5*draws)/games.
 
-    Returns dict(a, b, draws, games, score, accepted).
+    The arena uses a deterministic paired-opening suite (generated from
+    cfg.arena_seed) so results are comparable across evaluations.  Returns
+    dict(a, b, draws, games, score, accepted, opening_seed, opening_pairs,
+    opening_suite_hash).
     """
     net.eval()
     best_net.eval()
+    opening_seed = int(getattr(cfg, "arena_seed", 424242))
+    num_pairs = int(cfg.arena_games) // 2
+    openings = generate_arena_openings(
+        num_pairs,
+        int(getattr(cfg, "arena_opening_plies", 8)),
+        opening_seed,
+    )
+    suite_hash = arena_suite_hash(openings)
+    # play_match regenerates the same deterministic suite internally (seeded by
+    # cfg.arena_seed); the hash above describes exactly that suite.
     result = play_match(net, best_net, cfg, num_games=cfg.arena_games)
     wins = int(result["a"])
     losses = int(result["b"])
@@ -718,7 +825,9 @@ def _arena_gate(cfg, net, best_net):
     score = (wins + 0.5 * draws) / games if games else 0.0
     accepted = score >= float(getattr(cfg, "arena_accept_threshold", 0.55))
     return {"a": wins, "b": losses, "draws": draws, "games": games,
-            "score": score, "accepted": accepted}
+            "score": score, "accepted": accepted,
+            "opening_seed": opening_seed, "opening_pairs": num_pairs,
+            "opening_suite_hash": suite_hash}
 
 
 # --------------------------------------------------------------------------- #
@@ -800,12 +909,16 @@ def _collect_games(cfg, result_queue, procs, games_needed, stop_event=None,
 #  serial loop                                                                 #
 # --------------------------------------------------------------------------- #
 
-def run(cfg=None, resume=False, on_iteration=None):
+def run(cfg=None, resume=False, on_iteration=None, warm_start_checkpoint=None):
     """The full self-play / train / arena loop.
 
     `on_iteration(iteration)` is called after each completed iteration (and its
     checkpoint); raising from it simulates a graceful interruption, which is
     still checkpointed in `finally`.
+
+    `warm_start_checkpoint` starts a NEW training lineage from the accepted-best
+    weights of a compatible schema-v3 checkpoint (empty replay, fresh optimizer,
+    new run_id) — mutually exclusive with `resume`.
     """
     if cfg is None:
         cfg = Config()
@@ -829,8 +942,35 @@ def run(cfg=None, resume=False, on_iteration=None):
     generation = 0
     optimizer_steps = 0
     run_id = _make_run_id(cfg)
+    provenance = None
 
-    if resume:
+    if warm_start_checkpoint is not None:
+        if resume:
+            raise ValueError(
+                "--resume and --warm-start-checkpoint are mutually exclusive"
+            )
+        wm = _load_warm_start(cfg, warm_start_checkpoint)
+        net.load_state_dict(wm["best"])
+        best_net.load_state_dict(wm["best"])
+        # optimizer/scaler/buffer stay fresh (empty) from construction above;
+        # generation/steps/iteration reset for the new corrected lineage.
+        generation = 0
+        optimizer_steps = 0
+        start_iteration = 1
+        run_id = _make_run_id(cfg)  # new lineage -> new run id
+        provenance = {
+            "parent_run_id": wm["parent_run_id"],
+            "parent_iteration": wm["parent_iteration"],
+            "parent_generation": wm["parent_generation"],
+            "warm_started_from": wm["warm_started_from"],
+        }
+        print(
+            f"Warm-started new lineage {run_id} from {wm['warm_started_from']} "
+            f"(parent run {wm['parent_run_id']}, "
+            f"iter {wm['parent_iteration']}, gen {wm['parent_generation']})",
+            flush=True,
+        )
+    elif resume:
         state = _load_latest_v2(cfg)  # raises IncompatibleCheckpointError for v1
         if state is not None:
             net.load_state_dict(state["candidate"])
@@ -861,6 +1001,7 @@ def run(cfg=None, resume=False, on_iteration=None):
     iteration = start_iteration - 1
     completed_iteration = start_iteration - 1
     interrupted = False
+    round_seed = None
 
     try:
         for iteration in range(start_iteration, num_iterations + 1):
@@ -894,6 +1035,9 @@ def run(cfg=None, resume=False, on_iteration=None):
                     generation=generation, wins=outcome["a"],
                     draws=outcome["draws"], losses=outcome["b"],
                     score=outcome["score"], accepted=outcome["accepted"],
+                    opening_seed=outcome.get("opening_seed"),
+                    opening_pairs=outcome.get("opening_pairs"),
+                    opening_suite_hash=outcome.get("opening_suite_hash"),
                 )
 
             # ---- 4. durable checkpoint after EVERY completed iteration ----
@@ -902,7 +1046,7 @@ def run(cfg=None, resume=False, on_iteration=None):
                          optimizer_steps=optimizer_steps, net=net,
                          best_net=best_net, optimizer=optimizer,
                          buffer=buffer, reason="iteration",
-                         scaler=scaler, device=device)
+                         scaler=scaler, device=device, provenance=provenance)
             completed_iteration = iteration
             if iteration % int(getattr(cfg, "checkpoint_every_iterations", 1)) == 0:
                 _snapshot_checkpoint(cfg, iteration)
@@ -913,7 +1057,8 @@ def run(cfg=None, resume=False, on_iteration=None):
                          value_loss=train_out["value_loss"],
                          entropy=train_out["entropy"],
                          optimizer_steps=optimizer_steps,
-                         replay_size=len(buffer), games=games_played)
+                         replay_size=len(buffer), games=games_played,
+                         round_seed=round_seed)
             print(
                 f"iter {iteration:4d}  gen {generation}  steps {optimizer_steps}"
                 f"  buffer {len(buffer)}  "
@@ -939,7 +1084,7 @@ def run(cfg=None, resume=False, on_iteration=None):
                          optimizer_steps=optimizer_steps, net=net,
                          best_net=best_net, optimizer=optimizer,
                          buffer=buffer, reason="final",
-                         scaler=scaler, device=device)
+                         scaler=scaler, device=device, provenance=provenance)
             reason = "final"
         else:
             reason = "interrupt" if interrupted else "final"
@@ -957,7 +1102,8 @@ def run(cfg=None, resume=False, on_iteration=None):
 #  parallel loop                                                               #
 # --------------------------------------------------------------------------- #
 
-def run_parallel(cfg=None, resume=False, num_workers=None, on_iteration=None):
+def run_parallel(cfg=None, resume=False, num_workers=None, on_iteration=None,
+                 warm_start_checkpoint=None):
     """Self-play / train / arena loop with parallel self-play worker processes.
 
     CPU-heavy MCTS work runs in `num_workers` processes (one game each, in
@@ -997,8 +1143,33 @@ def run_parallel(cfg=None, resume=False, num_workers=None, on_iteration=None):
     generation = 0
     optimizer_steps = 0
     run_id = _make_run_id(cfg)
+    provenance = None
 
-    if resume:
+    if warm_start_checkpoint is not None:
+        if resume:
+            raise ValueError(
+                "--resume and --warm-start-checkpoint are mutually exclusive"
+            )
+        wm = _load_warm_start(cfg, warm_start_checkpoint)
+        net.load_state_dict(wm["best"])
+        best_net.load_state_dict(wm["best"])
+        generation = 0
+        optimizer_steps = 0
+        start_iteration = 1
+        run_id = _make_run_id(cfg)
+        provenance = {
+            "parent_run_id": wm["parent_run_id"],
+            "parent_iteration": wm["parent_iteration"],
+            "parent_generation": wm["parent_generation"],
+            "warm_started_from": wm["warm_started_from"],
+        }
+        print(
+            f"Warm-started new lineage {run_id} from {wm['warm_started_from']} "
+            f"(parent run {wm['parent_run_id']}, "
+            f"iter {wm['parent_iteration']}, gen {wm['parent_generation']})",
+            flush=True,
+        )
+    elif resume:
         state = _load_latest_v2(cfg)  # raises IncompatibleCheckpointError for v1
         if state is not None:
             net.load_state_dict(state["candidate"])
@@ -1064,6 +1235,7 @@ def run_parallel(cfg=None, resume=False, num_workers=None, on_iteration=None):
     iteration = start_iteration - 1
     completed_iteration = start_iteration - 1
     interrupted = False
+    round_seed = None
 
     try:
         for iteration in range(start_iteration, num_iterations + 1):
@@ -1101,6 +1273,9 @@ def run_parallel(cfg=None, resume=False, num_workers=None, on_iteration=None):
                     generation=generation, wins=outcome["a"],
                     draws=outcome["draws"], losses=outcome["b"],
                     score=outcome["score"], accepted=outcome["accepted"],
+                    opening_seed=outcome.get("opening_seed"),
+                    opening_pairs=outcome.get("opening_pairs"),
+                    opening_suite_hash=outcome.get("opening_suite_hash"),
                 )
 
             # ---- 4. durable checkpoint after EVERY completed iteration ----
@@ -1109,7 +1284,7 @@ def run_parallel(cfg=None, resume=False, num_workers=None, on_iteration=None):
                          optimizer_steps=optimizer_steps, net=net,
                          best_net=best_net, optimizer=optimizer,
                          buffer=buffer, reason="iteration",
-                         scaler=scaler, device=device)
+                         scaler=scaler, device=device, provenance=provenance)
             completed_iteration = iteration
             if iteration % int(getattr(cfg, "checkpoint_every_iterations", 1)) == 0:
                 _snapshot_checkpoint(cfg, iteration)
@@ -1120,7 +1295,8 @@ def run_parallel(cfg=None, resume=False, num_workers=None, on_iteration=None):
                          value_loss=train_out["value_loss"],
                          entropy=train_out["entropy"],
                          optimizer_steps=optimizer_steps,
-                         replay_size=len(buffer), games=games_played)
+                         replay_size=len(buffer), games=games_played,
+                         round_seed=round_seed)
             print(
                 f"iter {iteration:4d}  gen {generation}  steps {optimizer_steps}"
                 f"  buffer {len(buffer)}",
@@ -1155,7 +1331,7 @@ def run_parallel(cfg=None, resume=False, num_workers=None, on_iteration=None):
                          optimizer_steps=optimizer_steps, net=net,
                          best_net=best_net, optimizer=optimizer,
                          buffer=buffer, reason="final",
-                         scaler=scaler, device=device)
+                         scaler=scaler, device=device, provenance=provenance)
             reason = "final"
         else:
             reason = "interrupt" if interrupted else "final"
@@ -1173,7 +1349,8 @@ def run_parallel(cfg=None, resume=False, num_workers=None, on_iteration=None):
 #  native self-play loop                                                       #
 # --------------------------------------------------------------------------- #
 
-def run_native(cfg=None, resume=False, on_iteration=None):
+def run_native(cfg=None, resume=False, on_iteration=None,
+               warm_start_checkpoint=None):
     """Self-play / train / arena loop with the native C++ actor + GPU runtime.
 
     Replaces the Python worker-process self-play (`run_parallel`) with one
@@ -1204,8 +1381,33 @@ def run_native(cfg=None, resume=False, on_iteration=None):
     generation = 0
     optimizer_steps = 0
     run_id = _make_run_id(cfg)
+    provenance = None
 
-    if resume:
+    if warm_start_checkpoint is not None:
+        if resume:
+            raise ValueError(
+                "--resume and --warm-start-checkpoint are mutually exclusive"
+            )
+        wm = _load_warm_start(cfg, warm_start_checkpoint)
+        net.load_state_dict(wm["best"])
+        best_net.load_state_dict(wm["best"])
+        generation = 0
+        optimizer_steps = 0
+        start_iteration = 1
+        run_id = _make_run_id(cfg)
+        provenance = {
+            "parent_run_id": wm["parent_run_id"],
+            "parent_iteration": wm["parent_iteration"],
+            "parent_generation": wm["parent_generation"],
+            "warm_started_from": wm["warm_started_from"],
+        }
+        print(
+            f"Warm-started new lineage {run_id} from {wm['warm_started_from']} "
+            f"(parent run {wm['parent_run_id']}, "
+            f"iter {wm['parent_iteration']}, gen {wm['parent_generation']})",
+            flush=True,
+        )
+    elif resume:
         state = _load_latest_v2(cfg)
         if state is not None:
             net.load_state_dict(state["candidate"])
@@ -1242,6 +1444,7 @@ def run_native(cfg=None, resume=False, on_iteration=None):
     iteration = start_iteration - 1
     completed_iteration = start_iteration - 1
     interrupted = False
+    round_seed = None
 
     try:
         for iteration in range(start_iteration, num_iterations + 1):
@@ -1249,12 +1452,17 @@ def run_native(cfg=None, resume=False, on_iteration=None):
             net.eval()
             best_net.eval()
             inference_fn.update_weights(best_net.state_dict())
+            # Per-iteration round seed: derived from (cfg.seed, iteration) so
+            # consecutive iterations play genuinely new games while resuming at
+            # the same iteration boundary reproduces the identical round.
+            round_seed = native_selfplay.derive_selfplay_seed(cfg.seed, iteration)
             sp = native_selfplay.NativeSelfPlay(
                 cfg,
                 inference_fn,
                 games=cfg.games_per_iteration,
                 weight_version=optimizer_steps,  # monotonically increases
                 generation=generation,
+                seed=round_seed,
             )
             buffer.extend(sp.run())
             games_played += cfg.games_per_iteration
@@ -1280,6 +1488,9 @@ def run_native(cfg=None, resume=False, on_iteration=None):
                     generation=generation, wins=outcome["a"],
                     draws=outcome["draws"], losses=outcome["b"],
                     score=outcome["score"], accepted=outcome["accepted"],
+                    opening_seed=outcome.get("opening_seed"),
+                    opening_pairs=outcome.get("opening_pairs"),
+                    opening_suite_hash=outcome.get("opening_suite_hash"),
                 )
 
             # ---- 4. durable checkpoint after EVERY completed iteration ----
@@ -1288,7 +1499,7 @@ def run_native(cfg=None, resume=False, on_iteration=None):
                          optimizer_steps=optimizer_steps, net=net,
                          best_net=best_net, optimizer=optimizer,
                          buffer=buffer, reason="iteration",
-                         scaler=scaler, device=device)
+                         scaler=scaler, device=device, provenance=provenance)
             completed_iteration = iteration
             if iteration % int(getattr(cfg, "checkpoint_every_iterations", 1)) == 0:
                 _snapshot_checkpoint(cfg, iteration)
@@ -1299,7 +1510,8 @@ def run_native(cfg=None, resume=False, on_iteration=None):
                          value_loss=train_out["value_loss"],
                          entropy=train_out["entropy"],
                          optimizer_steps=optimizer_steps,
-                         replay_size=len(buffer), games=games_played)
+                         replay_size=len(buffer), games=games_played,
+                         round_seed=round_seed)
             print(
                 f"iter {iteration:4d}  gen {generation}  steps {optimizer_steps}"
                 f"  buffer {len(buffer)}  "
@@ -1322,7 +1534,7 @@ def run_native(cfg=None, resume=False, on_iteration=None):
                          optimizer_steps=optimizer_steps, net=net,
                          best_net=best_net, optimizer=optimizer,
                          buffer=buffer, reason="final",
-                         scaler=scaler, device=device)
+                         scaler=scaler, device=device, provenance=provenance)
             reason = "final"
         else:
             reason = "interrupt" if interrupted else "final"
@@ -1336,14 +1548,24 @@ def run_native(cfg=None, resume=False, on_iteration=None):
         print("Training complete.", flush=True)
 
 
-if __name__ == "__main__":
+def build_parser():
+    """Argument parser for the trainer (extracted for testability)."""
     import argparse
 
     p = argparse.ArgumentParser(description="AlphaZero-style chess self-play trainer")
-    p.add_argument(
+    mode = p.add_mutually_exclusive_group()
+    mode.add_argument(
         "--resume",
         action="store_true",
         help="Resume from checkpoints/latest.pt if present",
+    )
+    mode.add_argument(
+        "--warm-start-checkpoint",
+        type=str,
+        default=None,
+        metavar="PATH",
+        help="Start a NEW lineage from the accepted-best weights of this "
+             "compatible schema-v3 checkpoint (empty replay, fresh optimizer)",
     )
     p.add_argument(
         "--workers",
@@ -1361,7 +1583,11 @@ if __name__ == "__main__":
     p.add_argument("--games-per-iteration", type=int, default=None)
     p.add_argument("--num-iterations", type=int, default=None)
     p.add_argument("--arena-every", type=int, default=None)
-    args = p.parse_args()
+    return p
+
+
+def main(argv=None):
+    args = build_parser().parse_args(argv)
 
     # Apply runnable overrides to a Config before dispatch.
     cfg = None
@@ -1379,8 +1605,15 @@ if __name__ == "__main__":
             cfg.arena_every = args.arena_every
 
     if args.selfplay_backend == "native":
-        run_native(cfg=cfg, resume=args.resume)
+        run_native(cfg=cfg, resume=args.resume,
+                   warm_start_checkpoint=args.warm_start_checkpoint)
     elif args.workers >= 2:
-        run_parallel(cfg=cfg, resume=args.resume, num_workers=args.workers)
+        run_parallel(cfg=cfg, resume=args.resume, num_workers=args.workers,
+                     warm_start_checkpoint=args.warm_start_checkpoint)
     else:
-        run(cfg=cfg, resume=args.resume)
+        run(cfg=cfg, resume=args.resume,
+            warm_start_checkpoint=args.warm_start_checkpoint)
+
+
+if __name__ == "__main__":
+    main()
