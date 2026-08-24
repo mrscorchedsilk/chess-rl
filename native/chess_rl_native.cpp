@@ -298,5 +298,9 @@ PYBIND11_MODULE(_chess_rl_native, module) {
         .def("advance", &Actor::advance)
         .def("finished_games", &actor_finished_games)
         .def("is_done", &Actor::is_done)
-        .def("games_remaining", &Actor::games_remaining);
+        .def("games_remaining", &Actor::games_remaining)
+        .def_property_readonly(
+            "num_threads", &Actor::num_threads,
+            "Size of the persistent worker pool actually in use (clamped to "
+            "hardware_concurrency() and to the game count).");
 }

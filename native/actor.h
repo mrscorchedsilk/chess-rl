@@ -7,11 +7,13 @@
 #include <optional>
 #include <random>
 #include <string>
+#include <memory>
 #include <thread>
 #include <utility>
 #include <vector>
 
 #include "mcts.h"
+#include "thread_pool.h"
 #include "policy.h"
 #include "position.h"
 
@@ -99,6 +101,11 @@ class Actor {
     [[nodiscard]] bool is_done() const;
     [[nodiscard]] int games_remaining() const;
 
+    // Size of the persistent worker pool actually in use.  Clamped to
+    // std::thread::hardware_concurrency() and to the game count, so a caller
+    // asking for 20 threads for 20 games on a 16-thread CPU gets 16.
+    [[nodiscard]] int num_threads() const noexcept { return num_threads_; }
+
   private:
     struct GameState {
         std::optional<Position> pos;  // parked at the current root
@@ -121,14 +128,17 @@ class Actor {
     void finalise(int game_index, GameState& game, float white_result,
                   std::string termination);
 
-    // Runs fn(g) for g in [0, games_) across up to num_threads_ worker
-    // threads. Each game index is visited by exactly one thread; the games'
+    // Runs fn(g) for g in [0, games_) across the PERSISTENT worker pool.
+    // Each game index is visited by exactly one thread; the games'
     // MCTS/board/RNG state is fully independent so no per-game state is
     // shared between threads (only `finished_` needs a lock, taken in
-    // finalise()).
+    // finalise()).  Workers are created once in the constructor rather than
+    // spawned and joined per call; ordering of the merged output is still
+    // established serially by the caller, so results stay deterministic.
     void parallel_for(const std::function<void(int)>& fn);
 
     int num_threads_ = 1;
+    std::unique_ptr<ThreadPool> pool_;
     std::mutex finished_mutex_;
 
     double temperature_;

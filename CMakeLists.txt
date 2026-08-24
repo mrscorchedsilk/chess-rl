@@ -13,6 +13,7 @@ add_library(chess_rl_native_core STATIC
   native/policy.cpp
   native/node_pool.cpp
   native/mcts.cpp
+  native/thread_pool.cpp
 )
 target_compile_features(chess_rl_native_core PUBLIC cxx_std_17)
 set_target_properties(chess_rl_native_core PROPERTIES

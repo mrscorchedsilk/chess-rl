@@ -37,7 +37,8 @@ Actor::Actor(int games, double c_puct, double virtual_loss,
     : temperature_(temperature),
       temperature_threshold_(temperature_threshold),
       max_game_length_(max_game_length),
-      num_threads_(num_threads > 0 ? num_threads : games) {
+      num_threads_(ThreadPool::clamp_threads(
+          std::min(num_threads > 0 ? num_threads : games, games))) {
     if (games <= 0) throw std::invalid_argument("games must be positive");
     if (num_simulations < 0)
         throw std::invalid_argument("num_simulations must be >= 0");
@@ -63,28 +64,20 @@ Actor::Actor(int games, double c_puct, double virtual_loss,
         game.pos = Position::from_uci_history(START_FEN, {});
         game.mcts.set_root(START_FEN, {});
     }
+
+    // One persistent pool for the actor's whole lifetime.  Created after the
+    // games so a constructor throw above never leaves workers running.
+    if (num_threads_ > 1)
+        pool_ = std::make_unique<ThreadPool>(num_threads_);
 }
 
 void Actor::parallel_for(const std::function<void(int)>& fn) {
     const int n = static_cast<int>(games_.size());
-    const int t = std::max(1, std::min(num_threads_, n));
-    if (t <= 1) {
+    if (!pool_) {
         for (int g = 0; g < n; ++g) fn(g);
         return;
     }
-    std::atomic<int> next{0};
-    std::vector<std::thread> pool;
-    pool.reserve(static_cast<std::size_t>(t));
-    for (int i = 0; i < t; ++i) {
-        pool.emplace_back([&]() {
-            for (;;) {
-                const int g = next.fetch_add(1, std::memory_order_relaxed);
-                if (g >= n) break;
-                fn(g);
-            }
-        });
-    }
-    for (auto& th : pool) th.join();
+    pool_->parallel_for(n, fn);
 }
 
 void Actor::set_teacher(int weight_version, int generation) {
