@@ -175,5 +175,45 @@ switching branches.
 * **`evaluate.py` computes its baseline Wilson intervals differently** from
   `stats.py` (fractional successes over `n` games vs doubled trials). Both are
   defensible; having two conventions in one repo is not. Worth reconciling.
+### Why `--arena-backend native` is NOT in the command
+
+It is available (`--arena-backend native`), correct, and 1.68x faster than the
+Python arena on its own. Enabling it is still measured **net negative**, and
+the reason is an interaction, not the arena itself.
+
+`NativeArenaEngine` builds a SECOND `InferenceRuntime` in the same process as
+self-play. Two runtimes cannot both drive CUDA graphs: the second one's
+capture fails with `cudaErrorStreamCaptureInvalidated` and
+`beginAllocateToPool: already recording to mempool_id`, and **both** runtimes
+permanently fall back to eager. (Before the call-time fallback added in
+`9580c13`, this crashed the run outright.)
+
+Measured cost of losing the compiled path, batch 1024:
+
+| body | compiled | eager | loss |
+|---|---|---|---|
+| v2-6x128 | 8.38 ms (122k pos/s) | 10.32 ms (99k pos/s) | −19% |
+| v4-20x256 | 71.32 ms (14.4k pos/s) | 85.07 ms (12.0k pos/s) | −16% |
+
+Self-play inference is ~55% of a v4 round, so that is roughly a 9–10% hit on
+every iteration, against a ~4% saving on an arena that runs once every 50.
+Enable it only if you make the arena much larger or much more frequent — or,
+better, fix the cause: run the arena in a separate process, or teach it to
+share the self-play runtime instead of building its own.
+
+### Other arena caveats
+
+* **The native arena misses its own Ticket-D targets.** Measured: python
+  151.74 s median, native 90.06 s, **1.68x** — against targets of <= 60 s and
+  >= 2.0x. It is correct (20-game transcript hash matches the Ticket-C golden
+  `971b2c2e...`, stable across three runs), just not as fast as planned. Worth
+  enabling anyway, because the lower-bound gate needs ~5x the games.
+* **Native and Python arenas are statistically equivalent, not identical.**
+  They search the same way but iterate children in a different order, so a
+  position with TIED top visit counts can resolve differently — measured on
+  the same suite: python `6W/6D-ish {a:6,b:6,draws:8}`, native
+  `{a:3,b:3,draws:14}`, both scoring exactly 0.500 for identical nets.
+  Switching backends part-way through a lineage breaks the comparability the
+  deterministic paired-opening suite exists to provide.
 * **The moves-left head and resignation are untested at scale** — unit-tested,
   but never run for a long training job.

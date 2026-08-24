@@ -115,3 +115,21 @@ def test_checkpoint_dir_is_honoured(tmp_path):
 def test_no_overrides_leaves_cfg_none():
     """Unchanged behaviour: with no flags the run uses its own default Config."""
     assert build_cfg() is None
+
+
+def test_arena_backend_is_selectable_and_defaults_to_python():
+    """Native requires CUDA, so it must be opt-in.
+
+    Making it the config default would break every CPU-only environment:
+    NativeArenaEngine constructs an InferenceRuntime, which raises without a
+    GPU.  The documented v4 launch command passes it explicitly.
+    """
+    from config import Config
+    assert Config.arena_backend == "python"
+    cfg = build_cfg("--arena-backend", "native")
+    assert cfg.arena_backend == "native"
+
+
+def test_unknown_arena_backend_is_rejected():
+    with pytest.raises(SystemExit):
+        parse("--arena-backend", "cuda-magic")

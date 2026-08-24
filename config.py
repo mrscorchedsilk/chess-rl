@@ -180,6 +180,34 @@ class Config:
     # unchanged default) or "native" (native_arena.py + chess_rl_native.MCTS;
     # see docs/native-arena-design.md).  Game semantics (paired openings,
     # color swap, temp 0, no root noise, score/threshold) are identical.
+    # Arena engine.  The native path is measured CORRECT — its 20-game
+    # transcript hash matches the Ticket-C golden exactly and is stable across
+    # runs — and 1.68x faster than the Python arena (90.06s vs 151.74s median
+    # for a 20-game / 40-sim suite).  It misses its own Ticket-D targets
+    # (<= 60s, >= 2.0x), but the lower-bound promotion gate needs FIVE times
+    # the games it used to, so a 1.68x cheaper arena is worth having.
+    #
+    # Caveat: native and Python search identically but iterate children in a
+    # different order, so a position with TIED top visit counts can resolve to
+    # a different move (documented in tests/test_native_arena.py).  The two
+    # engines are statistically equivalent, not game-for-game identical.
+    # Do NOT switch backends part-way through a lineage: the paired-opening
+    # suite is deterministic precisely so candidate evaluations are comparable
+    # across iterations, and switching breaks that comparison.
+    #
+    # The DEFAULT stays "python" for two measured reasons:
+    #
+    # 1. It is the only backend that works without a GPU — NativeArenaEngine
+    #    builds an InferenceRuntime, which raises on a CPU-only machine, so a
+    #    native default would break every CPU-only test environment.
+    # 2. Enabling native is NET NEGATIVE in-process.  It builds a SECOND
+    #    InferenceRuntime, and two runtimes cannot both drive CUDA graphs:
+    #    capture fails and BOTH fall back to eager, costing 16-19% of
+    #    inference throughput at batch 1024 (v2 8.38 -> 10.32 ms, v4
+    #    71.32 -> 85.07 ms).  Self-play inference is ~55% of a v4 round, so
+    #    that is ~9-10% per iteration against a ~4% saving on an arena that
+    #    runs every 50.  Fix the cause (separate process, or share the
+    #    self-play runtime) before enabling this.
     arena_backend = "python"
 
     # ---- permanent phase telemetry (Ticket A; see docs/telemetry-design.md) ----

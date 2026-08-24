@@ -2240,6 +2240,11 @@ def build_parser():
                    help="deliberately resume under a different optimizer "
                         "(Adam and AdamW share a state_dict layout, so this "
                         "is otherwise refused)")
+    p.add_argument("--arena-backend", type=str, default=None,
+                   choices=("native", "python"),
+                   help="arena engine. Native is 1.68x faster and matches the "
+                        "correctness golden, but resolves tied top moves "
+                        "differently — do not switch mid-lineage.")
     p.add_argument("--arena-games", type=int, default=None)
     p.add_argument("--arena-simulations", type=int, default=None)
     p.add_argument("--moves-left-head", action="store_true",
@@ -2263,6 +2268,7 @@ def main(argv=None):
         args.games_in_flight, args.shards, args.train_epoch_size,
         args.replay_size, args.arena_games, args.arena_simulations,
         args.optimizer, args.lr_schedule, args.max_game_length,
+        args.arena_backend,
     )
     cfg = None
     if (any(v is not None for v in overrides) or args.moves_left_head
@@ -2292,6 +2298,8 @@ def main(argv=None):
             cfg.num_iterations = args.num_iterations
         if args.arena_every is not None:
             cfg.arena_every = args.arena_every
+        if args.arena_backend is not None:
+            cfg.arena_backend = args.arena_backend
         if args.arena_games is not None:
             cfg.arena_games = args.arena_games
         if args.arena_simulations is not None:
