@@ -846,7 +846,7 @@ def _new_optimizer(cfg, net):
 
 def _epoch_train(cfg, net, optimizer, buffer, device, scaler=None, *,
                  run_id=None, iteration=None, generation=None,
-                 optimizer_steps_total=None):
+                 optimizer_steps_total=None, positions_generated=None):
     """Run `training_epochs` REAL epochs over a bounded, per-epoch-shuffled
     sample from the replay buffer.  Each minibatch is one optimizer step.
 
@@ -868,7 +868,9 @@ def _epoch_train(cfg, net, optimizer, buffer, device, scaler=None, *,
                          getattr(cfg, "epochs_per_iteration", 3)))
     if n == 0 or epochs <= 0:
         return {"policy_loss": 0.0, "value_loss": 0.0, "entropy": 0.0,
-                "steps": 0, "batches": 0}
+                "steps": 0, "batches": 0, "positions_trained": 0,
+                "positions_generated": int(positions_generated or 0),
+                "sample_reuse": 0.0, "sample_size": 0}
     sample_size = min(
         n,
         int(getattr(cfg, "train_epoch_size", 0)
@@ -876,7 +878,9 @@ def _epoch_train(cfg, net, optimizer, buffer, device, scaler=None, *,
     )
     if sample_size <= 0:
         return {"policy_loss": 0.0, "value_loss": 0.0, "entropy": 0.0,
-                "steps": 0, "batches": 0}
+                "steps": 0, "batches": 0, "positions_trained": 0,
+                "positions_generated": int(positions_generated or 0),
+                "sample_reuse": 0.0, "sample_size": 0}
 
     net.train()
     sum_policy = sum_value = sum_entropy = 0.0
@@ -916,12 +920,22 @@ def _epoch_train(cfg, net, optimizer, buffer, device, scaler=None, *,
                 sum_entropy += float(entropy.item())
                 steps += 1
                 batches += 1
+    # Training-rate accounting.  `positions_trained` counts sample
+    # PRESENTATIONS (sample_size once per epoch), not distinct rows, and
+    # `sample_reuse` is presentations per freshly generated position — the
+    # ratio that says whether the learner is keeping up with the actor.
+    positions_trained = int(sample_size) * int(epochs)
+    gen = int(positions_generated or 0)
     result = {
         "policy_loss": sum_policy / batches,
         "value_loss": sum_value / batches,
         "entropy": sum_entropy / batches,
         "steps": steps,
         "batches": batches,
+        "sample_size": int(sample_size),
+        "positions_trained": positions_trained,
+        "positions_generated": gen,
+        "sample_reuse": (positions_trained / gen) if gen > 0 else 0.0,
     }
     try:
         telemetry.safe_emit(cfg, {
@@ -934,6 +948,16 @@ def _epoch_train(cfg, net, optimizer, buffer, device, scaler=None, *,
             "steps": result["steps"],
             "batches": result["batches"],
             "train_batch_size": int(getattr(cfg, "train_batch_size", 0)),
+            "train_epoch_size": int(getattr(cfg, "train_epoch_size", 0)),
+            "epochs": int(epochs),
+            "sample_size": result["sample_size"],
+            "replay_size": int(n),
+            "positions_generated": result["positions_generated"],
+            "positions_trained": result["positions_trained"],
+            "sample_reuse": result["sample_reuse"],
+            "steps_per_iteration": result["steps"],
+            "steps_per_second": (result["steps"] / _train_timer.duration_s
+                                 if _train_timer.duration_s else None),
             "policy_loss": result["policy_loss"],
             "value_loss": result["value_loss"],
             "entropy": result["entropy"],
@@ -1196,10 +1220,12 @@ def run(cfg=None, resume=False, on_iteration=None, warm_start_checkpoint=None):
             # ---- 1. self-play with the ACCEPTED best as teacher ----
             net.eval()
             best_net.eval()
-            buf_before = len(buffer)
+            sp_examples_n = 0
             with telemetry.PhaseTimer("selfplay") as _sp_timer:
                 for _ in range(cfg.games_per_iteration):
-                    buffer.extend(play_game(best_net, cfg))
+                    _game_examples = play_game(best_net, cfg)
+                    sp_examples_n += len(_game_examples)
+                    buffer.extend(_game_examples)
                     games_played += 1
             try:
                 telemetry.safe_emit(cfg, {
@@ -1210,7 +1236,7 @@ def run(cfg=None, resume=False, on_iteration=None, warm_start_checkpoint=None):
                     "generation": generation,
                     "duration_s": _sp_timer.duration_s,
                     "games": cfg.games_per_iteration,
-                    "examples": len(buffer) - buf_before,
+                    "examples": sp_examples_n,
                 })
             except Exception:  # noqa: BLE001 - telemetry must never kill training
                 pass
@@ -1219,7 +1245,8 @@ def run(cfg=None, resume=False, on_iteration=None, warm_start_checkpoint=None):
             train_out = _epoch_train(cfg, net, optimizer, buffer, device, scaler,
                                      run_id=run_id, iteration=iteration,
                                      generation=generation,
-                                     optimizer_steps_total=optimizer_steps)
+                                     optimizer_steps_total=optimizer_steps,
+                                     positions_generated=sp_examples_n)
             optimizer_steps += train_out["steps"]
 
             # ---- 3. arena gate: candidate vs incumbent best ----
@@ -1481,7 +1508,8 @@ def run_parallel(cfg=None, resume=False, num_workers=None, on_iteration=None,
             train_out = _epoch_train(cfg, net, optimizer, buffer, device, scaler,
                                      run_id=run_id, iteration=iteration,
                                      generation=generation,
-                                     optimizer_steps_total=optimizer_steps)
+                                     optimizer_steps_total=optimizer_steps,
+                                     positions_generated=len(games))
             optimizer_steps += train_out["steps"]
 
             # ---- 3. arena gate: candidate vs incumbent best ----
@@ -1745,7 +1773,8 @@ def run_native(cfg=None, resume=False, on_iteration=None,
             train_out = _epoch_train(cfg, net, optimizer, buffer, device, scaler,
                                      run_id=run_id, iteration=iteration,
                                      generation=generation,
-                                     optimizer_steps_total=optimizer_steps)
+                                     optimizer_steps_total=optimizer_steps,
+                                     positions_generated=len(sp_examples))
             optimizer_steps += train_out["steps"]
 
             # ---- 3. arena gate: candidate vs incumbent best ----

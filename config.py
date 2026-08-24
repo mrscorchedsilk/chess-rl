@@ -69,6 +69,19 @@ class Config:
     train_batch_size = 256       # samples per gradient step
     training_epochs = 3          # full passes over the bounded per-iteration sample
     epochs_per_iteration = 3     # backward-compatible alias
+    # Positions drawn from the replay buffer per epoch.  Previously this was
+    # only ever read via ``getattr(cfg, "train_epoch_size", 0)`` and was never
+    # defined, so the bound silently collapsed to
+    # ``train_batch_size * training_epochs`` == 768 -> 3 batches/epoch ->
+    # 9 optimizer steps per iteration, i.e. roughly ONE gradient step per 260
+    # freshly generated positions.  It is now explicit.
+    #
+    # 8192 with train_batch_size 256 and 3 epochs gives 32 batches/epoch and
+    # 96 optimizer steps/iteration.  Against ~2.4k positions generated per
+    # iteration that is a sample-reuse ratio near 10; `training_rate`
+    # telemetry reports the realised ratio every iteration so it can be tuned
+    # against overfitting to a stale buffer rather than guessed.
+    train_epoch_size = 8192
     games_per_iteration = 20
     replay_buffer_size = 50_000
     num_iterations = 200

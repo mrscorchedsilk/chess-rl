@@ -1,0 +1,20 @@
+{
+  "arch": "v2-6x128",
+  "params": 2170218,
+  "device": "cuda",
+  "train_epoch_size": 768,
+  "train_batch_size": 256,
+  "epochs": 3,
+  "replay_rows": 20000,
+  "steps_per_iteration": 9,
+  "sample_size": 768,
+  "positions_trained": 2304,
+  "sample_reuse": 0.96,
+  "train_phase_s": 0.2040691220026929,
+  "ms_per_step": 22.6743468891881,
+  "samples_per_s": 11290.292119596597,
+  "peak_vram_gb": 0.213715968,
+  "sec_per_iteration": 91.0,
+  "steps_per_hour": 356.04395604395603,
+  "train_fraction_of_iteration": 0.0022425178242054165
+}
