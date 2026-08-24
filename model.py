@@ -178,6 +178,34 @@ class ChessNet(torch.nn.Module):
         self.value_fc1 = nn.Linear(flat_size, n_f)
         self.value_fc2 = nn.Linear(n_f, 1)
 
+        # ---- optional moves-left auxiliary head (KataGo-style) ----
+        # Predicts how many plies remain in the game.  It is an auxiliary
+        # TARGET, not an output the search uses: its job is to regularise the
+        # shared trunk and speed up value convergence, because "who is winning"
+        # and "how long until it is over" are learned from the same features.
+        #
+        # OFF by default.  Turning it on adds parameters and therefore changes
+        # the state_dict, so a checkpoint written with the head cannot load
+        # into a net without it (and vice versa).  `heads_id` records the head
+        # set so the checkpoint layer can say so plainly instead of surfacing
+        # a raw missing/unexpected-keys error.
+        self.has_moves_left = bool(getattr(cfg, "moves_left_head", False))
+        if self.has_moves_left:
+            self.moves_left_conv = nn.Conv2d(n_f, 32, kernel_size=1,
+                                             bias=conv_bias)
+            self.moves_left_fc1 = nn.Linear(flat_size, n_f)
+            self.moves_left_fc2 = nn.Linear(n_f, 1)
+
+    @property
+    def heads_id(self):
+        """Canonical label for the HEAD set, orthogonal to architecture_id.
+
+        architecture_id names the body (blocks x filters); two nets with the
+        same body but different heads have different state_dicts, so the head
+        set needs its own identity.
+        """
+        return "pv+ml" if self.has_moves_left else "pv"
+
     def parameter_count(self):
         """Total trainable parameter count (master weights, always FP32)."""
         return sum(p.numel() for p in self.parameters())
@@ -192,7 +220,13 @@ class ChessNet(torch.nn.Module):
             x = F.relu(x + residual)
         return x
 
-    def forward(self, x):
+    def forward(self, x, with_moves_left=False):
+        """(policy_logits, value), or (policy_logits, value, moves_left).
+
+        The third output is returned ONLY when explicitly requested, so every
+        existing two-tuple call site is unaffected whether or not the head
+        exists.
+        """
         x = self.body(x)
 
         # policy head: spatial conv, then NHWC flatten so
@@ -211,4 +245,17 @@ class ChessNet(torch.nn.Module):
         v = F.relu(self.value_fc1(v))
         value = torch.tanh(self.value_fc2(v))
 
-        return policy_logits, value
+        if not with_moves_left:
+            return policy_logits, value
+        if not self.has_moves_left:
+            raise RuntimeError(
+                "with_moves_left=True but this net has no moves-left head; "
+                "build it with cfg.moves_left_head = True"
+            )
+        # softplus keeps the prediction non-negative without saturating, which
+        # a ReLU output would do for every position it ever got wrong low.
+        ml = F.relu(self.moves_left_conv(x))
+        ml = ml.reshape(ml.size(0), -1)
+        ml = F.relu(self.moves_left_fc1(ml))
+        moves_left = F.softplus(self.moves_left_fc2(ml))
+        return policy_logits, value, moves_left

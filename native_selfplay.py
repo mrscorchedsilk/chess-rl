@@ -89,6 +89,28 @@ def derive_selfplay_seed(base_seed: int, iteration: int) -> int:
     return (x ^ (x >> 31)) & _MASK64
 
 
+def _with_moves_left(game_examples, enabled):
+    """Optionally attach the plies-remaining auxiliary target to one game.
+
+    The label needs no engine support: a finished game's examples are already
+    in ply order, so the position at index i has ``len - 1 - i`` plies left.
+    Deriving it here rather than in C++ keeps the native Example struct and
+    its serialisation untouched.
+
+    ``enabled`` is False unless the moves-left head is configured, and then
+    this yields the original ``(state, pi, z)`` triples untouched.  Emitting
+    4-tuples unconditionally would change the published example contract for
+    every consumer — replay, tests, the diversity audit — to no purpose when
+    the head is off.
+    """
+    if not enabled:
+        yield from game_examples
+        return
+    total = len(game_examples)
+    for i, (state, pi, z) in enumerate(game_examples):
+        yield state, pi, z, float(total - 1 - i)
+
+
 class NativeSelfPlay:
     """Runs self-play games with the native Actor + an injected inference fn.
 
@@ -132,6 +154,10 @@ class NativeSelfPlay:
         # per-game seeds from it.  cfg.seed is NEVER mutated here.
         actor_seed = int(seed) if seed is not None else int(cfg.seed)
         self.round_seed = actor_seed
+        # Auxiliary moves-left labels are emitted only when the head that
+        # consumes them is configured; otherwise the example contract stays
+        # the original (state, pi, z) triple.
+        self.emit_moves_left = bool(getattr(cfg, "moves_left_head", False))
         self.actor = native.Actor(
             games=self.games,
             c_puct=float(cfg.c_puct),
@@ -207,8 +233,8 @@ class NativeSelfPlay:
         self.round_duration_s = time.perf_counter() - t_round
         self.batch_stats = telemetry._percentiles(self.batch_b)
         for game in self.actor.finished_games():
-            for state, pi, z in game["examples"]:
-                examples.append((state, pi, z))
+            examples.extend(
+                _with_moves_left(game["examples"], self.emit_moves_left))
             # Generation-time trajectory identity: one BLAKE2 digest over the
             # game's ORDERED (state, pi, z) examples (design §2.3).
             self.trajectory_hashes.append(
@@ -381,6 +407,7 @@ class ShardedSelfPlay:
         self.shards = max(1, min(int(n_shards or 1), total))
 
         self.round_seed = int(seed) if seed is not None else int(cfg.seed)
+        self.emit_moves_left = bool(getattr(cfg, "moves_left_head", False))
         self.max_batch = int(getattr(cfg, "selfplay_max_batch", 256))
         self.leaves_per_game = int(
             getattr(cfg, "selfplay_leaves_per_game", 0) or 0)
@@ -543,8 +570,8 @@ class ShardedSelfPlay:
         examples: List[Tuple[np.ndarray, np.ndarray, float]] = []
         for actor in self.actors:
             for game in actor.finished_games():
-                for state, pi, z in game["examples"]:
-                    examples.append((state, pi, z))
+                examples.extend(
+                _with_moves_left(game["examples"], self.emit_moves_left))
                 self.trajectory_hashes.append(
                     telemetry.game_trajectory_hash(game["examples"])
                 )

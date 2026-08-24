@@ -1,0 +1,33 @@
+{
+  "arch": "v4-20x256",
+  "games": 96,
+  "sims": 100,
+  "rows": [
+    {
+      "shards": 4,
+      "shard_games": [
+        24,
+        24,
+        24,
+        24
+      ],
+      "games": 96,
+      "wall_s": 122.58464601100422,
+      "games_per_hour": 2819.276404069202,
+      "examples": 5510,
+      "gpu_busy_s": 86.20244852127507,
+      "gpu_busy_fraction": 0.7059627358036583,
+      "gather_s": 307.9812708374229,
+      "infer_s": 159.86410239967518,
+      "apply_s": 5.065387053153245,
+      "advance_s": 8.56806754207355,
+      "inference_calls": 2400,
+      "batch_mean": 231.34791666666666,
+      "batch_p50": 276.0,
+      "gpu_util_mean": 58.661386138613864,
+      "gpu_util_max": 95.0,
+      "gpu_power_mean_w": 203.4553465346535,
+      "gpu_samples": 505
+    }
+  ]
+}

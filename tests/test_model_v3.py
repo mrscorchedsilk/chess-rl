@@ -27,6 +27,10 @@ EXPECTED_PARAMS = {
     "v3-10x128": 3_352_938,
     "v3-10x192": 7_241_194,
     "v3-10x256": 12_604_010,
+    # v4 body: AlphaZero's own 20x256.  A NEW id — architecture_id is the
+    # guard that stops tensors loading into a different body, so this must
+    # never be a redefinition of an existing entry.
+    "v4-20x256": 24_415_850,
 }
 
 

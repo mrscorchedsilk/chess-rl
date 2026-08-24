@@ -31,6 +31,13 @@ ARCHITECTURES = {
     "v3-10x128": (10, 128),    # 3,352,938 params
     "v3-10x192": (10, 192),    # 7,241,194 params
     "v3-10x256": (10, 256),    # 12,604,010 params
+    # v4: AlphaZero's own body size.  A NEW id, never a redefinition of an
+    # existing one — architecture_id is what stops tensors from being loaded
+    # into a different body, so reusing "v3-10x256" for a different shape
+    # would defeat the guard.  v4 weights are incompatible with every earlier
+    # lineage by construction and must start from scratch in their own
+    # checkpoint directory.
+    "v4-20x256": (20, 256),    # 24,415,850 params
 }
 
 
@@ -50,6 +57,15 @@ class Config:
     # Gated behind an explicit v3 architecture id — v2 bodies are NEVER
     # silently mutated.
     remove_conv_bias = False
+    # Auxiliary moves-left head (KataGo).  Predicts plies remaining; the
+    # target is derived from the finished game, so no search or engine change
+    # is needed.  Regularises the shared trunk and speeds value convergence.
+    # Adding it changes the state_dict, so it cannot be switched on mid-run —
+    # see ChessNet.heads_id and the checkpoint head guard.
+    moves_left_head = False
+    moves_left_loss_weight = 0.1
+    # Plies used to normalise the target; max_game_length is the natural cap.
+    moves_left_scale = 400.0
     policy_planes = 73                # 56 queen-like (8 dirs x 7 dist) + 8 knight + 9 underpromo
     policy_size = policy_planes * 64  # 4672: flat index = from_square * 73 + plane
 
@@ -66,6 +82,28 @@ class Config:
     # ---- training ----
     learning_rate = 0.001
     weight_decay = 1e-4
+    # Optimizer.  "adam" was the original: torch.optim.Adam WITH weight_decay,
+    # which is coupled L2 folded into the adaptive step, not true decay.
+    # "adamw" decouples it (Loshchilov & Hutter) and is the default for new
+    # lineages; "sgd" (momentum 0.9, nesterov) is what AlphaZero itself used.
+    optimizer = "adamw"
+    sgd_momentum = 0.9
+    # Learning-rate schedule over OPTIMIZER STEPS (not iterations, which vary
+    # in length).  There was previously no scheduler at all: the rate stayed
+    # at 1e-3 for every step of a 2,300-iteration run, which caps final
+    # strength no matter how good the rest of the pipeline is.
+    #   "none"   - constant (previous behaviour)
+    #   "cosine" - warmup then cosine decay to lr_min
+    #   "step"   - multiply by lr_step_gamma every lr_step_size steps
+    lr_schedule = "cosine"
+    lr_warmup_steps = 2_000
+    lr_min = 1e-5
+    lr_total_steps = 2_000_000   # cosine horizon, in optimizer steps
+    lr_step_size = 200_000
+    lr_step_gamma = 0.1
+    # Escape hatch for _validate_optimizer_compat: resuming a checkpoint under
+    # a different optimizer is refused unless this is explicitly set.
+    allow_optimizer_change = False
     train_batch_size = 256       # samples per gradient step
     training_epochs = 3          # full passes over the bounded per-iteration sample
     epochs_per_iteration = 3     # backward-compatible alias
@@ -83,7 +121,18 @@ class Config:
     # against overfitting to a stale buffer rather than guessed.
     train_epoch_size = 8192
     games_per_iteration = 20
+    # Replay capacity.  50k is roughly 20 iterations of data — the buffer
+    # turns over about every half hour, so the learner trains on a narrow and
+    # rapidly-shifting window.  Larger capacities are supported; the startup
+    # preflight (replay.preflight_replay_capacity) projects RAM and checkpoint
+    # size from measured per-example costs and fails with an explicit message
+    # rather than hours later at a snapshot write.
+    #   measured: 4,146 bytes/example resident, 1,692 bytes/example on disk
+    #   500,000 rows -> ~2.07 GB RAM, ~0.85 GB added to every checkpoint
     replay_buffer_size = 50_000
+    replay_preflight = True
+    replay_ram_budget_fraction = 0.5    # max share of available RAM
+    replay_preflight_snapshots = 3      # snapshot generations to budget disk for
     num_iterations = 200
     amp = True                   # mixed precision (autocast + GradScaler) on CUDA
     # ---- training-path GPU ergonomics ----
@@ -108,6 +157,20 @@ class Config:
     # varied.  Temperature stays 0 and root noise stays off.
     arena_seed = 424242
     arena_opening_plies = 8
+    # Statistical gating.  A 20-game score has a 95% interval roughly +/- 0.2
+    # wide, so promoting on the point estimate promotes noise about as often
+    # as strength — which is what the live run's history shows (0.75 accept,
+    # 0.475 reject, four promotions in 300 iterations).  The gate is now the
+    # LOWER confidence bound: promote only when the interval says the
+    # candidate is above threshold.
+    #
+    # Consequence worth knowing before tuning arena_games: at threshold 0.55
+    # and 95% confidence, a candidate whose TRUE score is 0.60 needs about 176
+    # games to be promotable at all; 0.65 needs 44; 0.75 needs 10
+    # (stats.games_needed_for).  A 20-game arena can only ever confirm large
+    # improvements.
+    arena_confidence = 0.95
+    arena_require_lower_bound = True
     # Search backend for the arena gate: "python" (arena.py + mcts.py,
     # unchanged default) or "native" (native_arena.py + chess_rl_native.MCTS;
     # see docs/native-arena-design.md).  Game semantics (paired openings,
@@ -156,6 +219,12 @@ class Config:
     selfplay_max_batch = 4096
     # Actor worker threads; None -> min(hardware_concurrency, games).
     selfplay_actor_threads = None
+    # Actor shards driven by independent Python threads.  The serial loop
+    # (gather -> evaluate -> apply -> advance) leaves the GPU idle during tree
+    # descent and every CPU thread idle during the forward pass.  With >1 shard
+    # one shard holds the GPU while the others descend.  1 = the old serial
+    # path, byte-identical.
+    selfplay_shards = 2
 
     device = get_device()
 

@@ -341,7 +341,13 @@ def test_rejected_candidate_reverts_to_best_and_resets_optimizer(
 
 def test_accepted_candidate_becomes_new_best_and_generation_increments(
         tmp_path, monkeypatch):
-    cfg = make_cfg(tmp_path, num_iterations=1, arena_every=1)
+    # This test is about the MECHANICS of acceptance (candidate installed as
+    # best, generation incremented), not about the statistical gate.  A
+    # 2-game arena can never clear a lower confidence bound, so the gate is
+    # explicitly set to point-estimate mode here; the lower-bound gate has its
+    # own coverage in tests/test_arena_statistics.py.
+    cfg = make_cfg(tmp_path, num_iterations=1, arena_every=1,
+                   arena_require_lower_bound=False)
     make_fake_selfplay(monkeypatch,
                        lambda: [tuple(e) for e in synthetic_examples(10, seed=9)])
     make_fake_arena(monkeypatch, {"a": 2, "b": 0, "draws": 0})  # score 1.0 -> accept
@@ -381,15 +387,21 @@ def test_optimizer_steps_counts_real_gradient_steps(tmp_path, monkeypatch):
     make_fake_selfplay(monkeypatch,
                        lambda: [tuple(e) for e in synthetic_examples(10, seed=11)])
 
-    real_adam = torch.optim.Adam
+    # Counts real optimizer.step() calls.  Spies on whichever module alias
+    # cfg.optimizer selects, so this keeps testing the COUNTING contract
+    # rather than accidentally testing which optimizer is the default.
+    alias = {"adam": "Adam", "adamw": "AdamW", "sgd": "SGD"}[
+        str(getattr(cfg, "optimizer", "adam")).lower()
+    ]
+    real_cls = getattr(train, alias)
     calls = {"n": 0}
 
-    class CountingAdam(real_adam):
+    class Counting(real_cls):
         def step(self, *a, **k):
             calls["n"] += 1
             return super().step(*a, **k)
 
-    monkeypatch.setattr(train, "Adam", CountingAdam)
+    monkeypatch.setattr(train, alias, Counting)
 
     train.run(cfg, resume=False)
 
@@ -449,7 +461,11 @@ def test_iteration_metrics_event_only_arena_and_separate_losses(
 # --------------------------------------------------------------------------- #
 
 def test_arena_standard_score_counts_draws_as_half(tmp_path, monkeypatch):
-    cfg = make_cfg(tmp_path, num_iterations=1, arena_every=1, arena_games=4)
+    # Pins the SCORE definition (draws are half a point), not the promotion
+    # gate: 4 games cannot clear a confidence bound at any true strength, so
+    # point-estimate mode isolates the thing under test.
+    cfg = make_cfg(tmp_path, num_iterations=1, arena_every=1, arena_games=4,
+                   arena_require_lower_bound=False)
     make_fake_selfplay(monkeypatch,
                        lambda: [tuple(e) for e in synthetic_examples(10, seed=27)])
 
@@ -463,7 +479,7 @@ def test_arena_standard_score_counts_draws_as_half(tmp_path, monkeypatch):
     # 2 wins + 1 draw + 1 loss -> score 0.625 >= 0.55 -> accept (v1 wins/games
     # would have said 0.5 and rejected — this proves the standard score)
     cfg2 = make_cfg(tmp_path / "run2", num_iterations=1, arena_every=1,
-                    arena_games=4)
+                    arena_games=4, arena_require_lower_bound=False)
     make_fake_selfplay(monkeypatch,
                        lambda: [tuple(e) for e in synthetic_examples(10, seed=29)])
     make_fake_arena(monkeypatch, {"a": 2, "b": 1, "draws": 1})

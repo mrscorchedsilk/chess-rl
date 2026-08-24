@@ -26,6 +26,7 @@ memory stays ~10x smaller.
 """
 
 from collections import deque
+import os
 import threading
 
 import numpy as np
@@ -49,14 +50,23 @@ class ReplayBuffer:
         self._legal = deque(maxlen=self.capacity)      # int32 index arrays
         self._probs = deque(maxlen=self.capacity)      # float32 prob arrays
         self._zs = deque(maxlen=self.capacity)         # floats
+        # Optional auxiliary target: plies remaining in the game at this
+        # position (KataGo moves-left head).  Always stored so the row layout
+        # is uniform; 0.0 when the producer did not supply one, and
+        # `has_moves_left` says whether any real label was ever added.
+        self._moves_left = deque(maxlen=self.capacity)
+        self._any_moves_left = False
 
     # ------------------------------------------------------------------ API
 
     def __len__(self):
         return len(self._positions)
 
-    def add(self, state, pi, z):
-        """Append one example: (C,H,W) binary planes, (P,) dense policy, z."""
+    def add(self, state, pi, z, moves_left=None):
+        """Append one example: (C,H,W) binary planes, (P,) dense policy, z.
+
+        ``moves_left`` is the optional plies-remaining auxiliary target.
+        """
         state = np.asarray(state, dtype=np.float32)
         if state.shape != (self.num_input_planes, self.board_size, self.board_size):
             raise ValueError(
@@ -81,11 +91,41 @@ class ReplayBuffer:
         self._legal.append(idx)
         self._probs.append(probs)
         self._zs.append(float(z))
+        self._moves_left.append(0.0 if moves_left is None else float(moves_left))
+        if moves_left is not None:
+            self._any_moves_left = True
 
     def extend(self, examples):
-        """Append a list of ``(state, pi, z)`` tuples (self-play output)."""
-        for state, pi, z in examples:
-            self.add(state, pi, z)
+        """Append ``(state, pi, z)`` or ``(state, pi, z, moves_left)`` tuples.
+
+        Both arities are accepted so producers can adopt the auxiliary target
+        without every caller changing at once.
+        """
+        for example in examples:
+            if len(example) == 4:
+                state, pi, z, moves_left = example
+            else:
+                state, pi, z = example
+                moves_left = None
+            self.add(state, pi, z, moves_left)
+
+    @property
+    def has_moves_left(self):
+        """True once any example carried a real moves-left label."""
+        return self._any_moves_left
+
+    def moves_left_tensor(self, rows, device=None):
+        """(B, 1) float tensor of plies-remaining targets for ``rows``.
+
+        Kept separate from ``sample_indices`` so the (states, pis, zs) contract
+        — and the pinned loader built on it — stays exactly as it was; the
+        auxiliary target is opt-in and only fetched when the head is enabled.
+        """
+        rows = np.asarray(rows, dtype=np.int64).reshape(-1)
+        vals = np.array([self._moves_left[int(i)] for i in rows],
+                        dtype=np.float32).reshape(-1, 1)
+        t = torch.from_numpy(vals)
+        return t.to(device) if device is not None else t
 
     def sample(self, batch_size, device=None):
         """Sample (without replacement) uniformly and return a dense batch."""
@@ -182,6 +222,12 @@ class ReplayBuffer:
             "probs": probs,
             "offsets": offsets,
             "z": zs,
+            # Auxiliary moves-left targets.  A NEW optional key: older
+            # snapshots simply lack it and load as all-zeros with
+            # has_moves_left False, so resume compatibility is preserved.
+            "moves_left": (np.array(list(self._moves_left), dtype=np.float32)
+                           if len(self) else np.zeros(0, dtype=np.float32)),
+            "has_moves_left": bool(self._any_moves_left),
         }
 
     def load_state_dict(self, sd):
@@ -205,6 +251,8 @@ class ReplayBuffer:
         self._legal = deque(maxlen=self.capacity)
         self._probs = deque(maxlen=self.capacity)
         self._zs = deque(maxlen=self.capacity)
+        self._moves_left = deque(maxlen=self.capacity)
+        self._any_moves_left = bool(sd.get("has_moves_left", False))
         positions = np.asarray(sd["positions"], dtype=np.uint8)
         state_extra_idx = np.asarray(sd["state_extra_idx"], dtype=np.int32)
         state_extra_values = np.asarray(sd["state_extra_values"], dtype=np.float32)
@@ -213,7 +261,17 @@ class ReplayBuffer:
         probs = np.asarray(sd["probs"], dtype=np.float32)
         offsets = np.asarray(sd["offsets"], dtype=np.int64)
         zs = np.asarray(sd["z"], dtype=np.float32)
+        # Optional key: snapshots written before the auxiliary head existed
+        # have no moves_left array and restore as zeros.
+        moves_left = np.asarray(sd.get("moves_left", []), dtype=np.float32)
         n = positions.shape[0]
+        if moves_left.shape[0] not in (0, n):
+            raise ValueError(
+                "invalid replay state_dict: moves_left/positions mismatch "
+                f"({moves_left.shape[0]} vs {n})"
+            )
+        if moves_left.shape[0] == 0:
+            moves_left = np.zeros(n, dtype=np.float32)
         if offsets.shape[0] != n + 1:
             raise ValueError("invalid replay state_dict: offsets/positions mismatch")
         if state_extra_offsets.shape[0] != n + 1:
@@ -227,6 +285,7 @@ class ReplayBuffer:
             self._legal.append(legal[a:b])
             self._probs.append(probs[a:b])
             self._zs.append(float(zs[i]))
+            self._moves_left.append(float(moves_left[i]))
 
 
 # --------------------------------------------------------------------------- #
@@ -410,3 +469,110 @@ class PinnedReplayLoader:
         pis_p[:n].copy_(pis, non_blocking=False)
         zs_p[:n].copy_(zs, non_blocking=False)
         return states_p[:n], pis_p[:n], zs_p[:n]
+
+
+# --------------------------------------------------------------------------- #
+#  capacity preflight                                                          #
+# --------------------------------------------------------------------------- #
+
+# Measured on this encoding (104 planes, packbits + sparse non-binary extras,
+# ~30 legal moves per position) with 20,000 realistic positions:
+#   resident  4,146 bytes/example   (RSS delta / rows)
+#   serialised 1,692 bytes/example  (torch.save of state_dict / rows)
+# Both scale linearly in capacity.  Re-measure with
+# scripts/measure_replay_footprint.py if the encoding changes.
+REPLAY_BYTES_PER_EXAMPLE_RAM = 4146
+REPLAY_BYTES_PER_EXAMPLE_DISK = 1692
+
+
+class ReplayCapacityError(RuntimeError):
+    """Raised when a configured replay capacity cannot be honoured safely."""
+
+
+def _available_ram_bytes():
+    """Best-effort available (not merely free) system memory, or None."""
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) * 1024
+    except Exception:  # noqa: BLE001 - preflight must never be the failure
+        pass
+    try:
+        import os as _os
+        return _os.sysconf("SC_AVPHYS_PAGES") * _os.sysconf("SC_PAGE_SIZE")
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def estimate_replay_footprint(capacity):
+    """Projected resident and on-disk bytes for a replay of `capacity` rows."""
+    capacity = int(capacity)
+    return {
+        "capacity": capacity,
+        "ram_bytes": capacity * REPLAY_BYTES_PER_EXAMPLE_RAM,
+        "checkpoint_bytes": capacity * REPLAY_BYTES_PER_EXAMPLE_DISK,
+        "ram_gb": capacity * REPLAY_BYTES_PER_EXAMPLE_RAM / 1e9,
+        "checkpoint_gb": capacity * REPLAY_BYTES_PER_EXAMPLE_DISK / 1e9,
+    }
+
+
+def preflight_replay_capacity(cfg, available_ram_bytes=None, free_disk_bytes=None):
+    """Check a configured replay capacity against RAM and disk BEFORE training.
+
+    The replay lives in RAM for the whole run and is written into every
+    resumable checkpoint, so a capacity that does not fit fails hours in — at
+    a checkpoint write, with a partially-written snapshot and no clear cause.
+    This turns that into an explicit message at startup.
+
+    Returns the estimate dict.  Raises ReplayCapacityError when the projection
+    exceeds ``cfg.replay_ram_budget_fraction`` of available memory, or the
+    free disk needed for a few snapshot generations.  Set
+    ``cfg.replay_preflight = False`` to skip entirely.
+    """
+    est = estimate_replay_footprint(getattr(cfg, "replay_buffer_size", 0))
+    if not bool(getattr(cfg, "replay_preflight", True)):
+        return est
+
+    fraction = float(getattr(cfg, "replay_ram_budget_fraction", 0.5))
+    avail = (available_ram_bytes if available_ram_bytes is not None
+             else _available_ram_bytes())
+    if avail:
+        budget = avail * fraction
+        if est["ram_bytes"] > budget:
+            raise ReplayCapacityError(
+                f"replay_buffer_size={est['capacity']:,} needs about "
+                f"{est['ram_gb']:.2f} GB resident, which exceeds the "
+                f"{fraction:.0%} budget of {avail / 1e9:.2f} GB available RAM "
+                f"({budget / 1e9:.2f} GB).  Lower replay_buffer_size to about "
+                f"{int(budget / REPLAY_BYTES_PER_EXAMPLE_RAM):,}, raise "
+                f"cfg.replay_ram_budget_fraction if you know the box has "
+                f"headroom, or set cfg.replay_preflight = False to skip this "
+                f"check."
+            )
+
+    # A resumable snapshot embeds the whole replay, and the trainer keeps
+    # latest.pt plus versioned snapshots, so budget for a few generations.
+    keep = max(1, int(getattr(cfg, "replay_preflight_snapshots", 3)))
+    needed = est["checkpoint_bytes"] * keep
+    free = free_disk_bytes
+    if free is None:
+        try:
+            import shutil
+            target = getattr(cfg, "checkpoint_dir", ".") or "."
+            probe = target if os.path.isdir(target) else os.path.dirname(
+                os.path.abspath(target)) or "."
+            free = shutil.disk_usage(probe).free
+        except Exception:  # noqa: BLE001
+            free = None
+    if free is not None and needed > free:
+        raise ReplayCapacityError(
+            f"replay_buffer_size={est['capacity']:,} adds about "
+            f"{est['checkpoint_gb']:.2f} GB to EVERY resumable checkpoint; "
+            f"{keep} snapshots need {needed / 1e9:.2f} GB but only "
+            f"{free / 1e9:.2f} GB is free under "
+            f"{getattr(cfg, 'checkpoint_dir', '.')}.  Free space, lower "
+            f"replay_buffer_size, reduce checkpoint retention, or set "
+            f"cfg.replay_preflight = False."
+        )
+    return est

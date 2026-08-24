@@ -45,6 +45,11 @@ def make_cfg(tmp_path, **overrides):
     cfg.seed = 42
     cfg.checkpoint_dir = str(tmp_path / "ckpts")
     cfg.metrics_path = str(tmp_path / "training.jsonl")
+    # These tests exercise milestone WRITING, driven by tiny fake arena
+    # results.  A 2-game match can never clear a confidence bound, so the
+    # promotion gate is put in point-estimate mode; the lower-bound gate
+    # has its own coverage in tests/test_arena_statistics.py.
+    cfg.arena_require_lower_bound = False
     for k, v in overrides.items():
         setattr(cfg, k, v)
     return cfg

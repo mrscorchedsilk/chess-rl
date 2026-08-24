@@ -48,6 +48,7 @@ Queue.get() hang.  Legacy raw-example lists are still accepted.
 
 import hashlib
 import json
+import math
 import os
 import queue
 import random
@@ -65,11 +66,15 @@ from model import ChessNet
 from selfplay import play_game
 from arena import play_match, generate_arena_openings, arena_suite_hash
 from parallel import InferenceServer, worker_loop
-from replay import ReplayBuffer, PinnedReplayLoader
+from replay import (ReplayBuffer, PinnedReplayLoader,
+                    ReplayCapacityError, preflight_replay_capacity)
 import native_selfplay
+import stats
 import telemetry
 
-Adam = torch.optim.Adam  # module alias so tests can substitute a spy
+Adam = torch.optim.Adam    # module aliases so tests can substitute a spy
+AdamW = torch.optim.AdamW
+SGD = torch.optim.SGD
 
 # NOTE (schema versioning): the on-disk ``schema_version`` integer stays 2 —
 # the existing v2 suite pins ``payload["schema_version"] == CHECKPOINT_SCHEMA_VERSION == 2``.
@@ -408,6 +413,13 @@ def _save_latest(cfg, *, run_id, iteration, generation, optimizer_steps,
             "iteration": int(iteration),
             "generation": int(generation),
             "optimizer_steps": int(optimizer_steps),
+            # Optimizer identity and LR schedule travel WITH the checkpoint.
+            # Adam and AdamW have the same state_dict shape, so resuming an
+            # Adam run under an AdamW config would load cleanly and silently
+            # switch coupled L2 for decoupled decay mid-run.  Recorded here so
+            # _load_latest_v2 can refuse that.
+            "optimizer_kind": str(getattr(cfg, "optimizer", "adam")).lower(),
+            "lr_schedule": str(getattr(cfg, "lr_schedule", "none")).lower(),
             "candidate": net.state_dict(),
             "best": best_net.state_dict(),
             "optimizer": optimizer.state_dict(),
@@ -572,6 +584,35 @@ def _validate_checkpoint_compat(cfg, payload):
                 )
 
 
+def _validate_optimizer_compat(cfg, payload, path):
+    """Refuse to resume a run under a DIFFERENT optimizer than it was trained
+    with, unless the caller opts in.
+
+    Adam and AdamW share a state_dict layout, so ``load_state_dict`` would
+    accept the swap without complaint and the run would quietly switch from
+    coupled L2 to decoupled weight decay partway through — invisible in the
+    loss curve and impossible to reconstruct afterwards.
+
+    Checkpoints written before this field existed carry no
+    ``optimizer_kind``; those are treated as "adam", which is what they were.
+    Set ``cfg.allow_optimizer_change = True`` to override deliberately.
+    """
+    if bool(getattr(cfg, "allow_optimizer_change", False)):
+        return
+    stored = str(payload.get("optimizer_kind") or "adam").lower()
+    current = str(getattr(cfg, "optimizer", "adam")).lower()
+    if stored != current:
+        raise IncompatibleCheckpointError(
+            f"checkpoint {path} was trained with optimizer={stored!r} but the "
+            f"config asks for {current!r}.  Adam and AdamW have identical "
+            "state_dict layouts, so this would load silently and change the "
+            "weight-decay semantics mid-run.  Either set "
+            f"cfg.optimizer = {stored!r} to continue the run as it was "
+            "trained, or set cfg.allow_optimizer_change = True to switch "
+            "deliberately, or start a new lineage with --checkpoint-dir."
+        )
+
+
 def _load_latest_v2(cfg):
     """Return the latest resumable snapshot, or None if it doesn't exist.
 
@@ -603,6 +644,7 @@ def _load_latest_v2(cfg):
             "schema, not a v1 snapshot, and will never be auto-loaded."
         )
     _validate_checkpoint_compat(cfg, payload)
+    _validate_optimizer_compat(cfg, payload, path)
     return payload
 
 
@@ -840,8 +882,81 @@ def _save_milestone(cfg, net, *, run_id, iteration, generation, outcome):
 # --------------------------------------------------------------------------- #
 
 def _new_optimizer(cfg, net):
-    return Adam(net.parameters(), lr=cfg.learning_rate,
-                weight_decay=getattr(cfg, "weight_decay", 1e-4))
+    """Build the configured optimizer.
+
+    ``cfg.optimizer`` selects: "adamw" (default for new lineages — decoupled
+    weight decay), "adam" (the original: torch.optim.Adam WITH weight_decay,
+    i.e. coupled L2 folded into the adaptive step) or "sgd" (momentum,
+    nesterov — what AlphaZero used).  Unknown values raise rather than
+    silently falling back, so a typo in a config cannot quietly change the
+    optimizer of a long run.
+    """
+    kind = str(getattr(cfg, "optimizer", "adam")).lower()
+    lr = float(cfg.learning_rate)
+    wd = float(getattr(cfg, "weight_decay", 1e-4))
+    if kind == "adam":
+        return Adam(net.parameters(), lr=lr, weight_decay=wd)
+    if kind == "adamw":
+        return AdamW(net.parameters(), lr=lr, weight_decay=wd)
+    if kind == "sgd":
+        return SGD(
+            net.parameters(), lr=lr, weight_decay=wd,
+            momentum=float(getattr(cfg, "sgd_momentum", 0.9)), nesterov=True,
+        )
+    raise ValueError(
+        f"unknown cfg.optimizer {kind!r}; expected 'adamw', 'adam' or 'sgd'"
+    )
+
+
+def _lr_at_step(cfg, step: int) -> float:
+    """Learning rate for a given GLOBAL optimizer-step count.
+
+    Keyed on optimizer steps rather than iterations because an iteration is
+    not a fixed amount of learning — it depends on train_epoch_size, batch
+    size and how much replay is available.  A pure function of (cfg, step) is
+    also what makes the schedule exactly resumable: there is no hidden
+    scheduler state to serialise, so restoring optimizer_steps restores the
+    rate, and a resumed run cannot drift from an uninterrupted one.
+    """
+    base = float(getattr(cfg, "learning_rate", 1e-3))
+    kind = str(getattr(cfg, "lr_schedule", "none")).lower()
+    if kind in ("none", "", "constant"):
+        return base
+
+    step = max(0, int(step))
+    warmup = int(getattr(cfg, "lr_warmup_steps", 0) or 0)
+    if warmup > 0 and step < warmup:
+        # Linear warmup from base/warmup up to base; never starts at exactly
+        # 0, which would waste the first step entirely.
+        return base * float(step + 1) / float(warmup)
+
+    if kind == "step":
+        size = int(getattr(cfg, "lr_step_size", 0) or 0)
+        if size <= 0:
+            return base
+        gamma = float(getattr(cfg, "lr_step_gamma", 0.1))
+        return base * (gamma ** (step // size))
+
+    if kind == "cosine":
+        lr_min = float(getattr(cfg, "lr_min", 0.0))
+        total = int(getattr(cfg, "lr_total_steps", 0) or 0)
+        if total <= warmup:
+            return base
+        progress = (step - warmup) / float(total - warmup)
+        progress = min(1.0, max(0.0, progress))
+        return lr_min + 0.5 * (base - lr_min) * (1.0 + math.cos(math.pi * progress))
+
+    raise ValueError(
+        f"unknown cfg.lr_schedule {kind!r}; expected 'none', 'cosine' or 'step'"
+    )
+
+
+def _apply_lr(cfg, optimizer, step: int) -> float:
+    """Set every param group's lr for this step; returns the applied rate."""
+    lr = _lr_at_step(cfg, step)
+    for group in optimizer.param_groups:
+        group["lr"] = lr
+    return lr
 
 
 def _train_loader(cfg, buffer, device):
@@ -897,7 +1012,10 @@ def _epoch_train(cfg, net, optimizer, buffer, device, scaler=None, *,
         return {"policy_loss": 0.0, "value_loss": 0.0, "entropy": 0.0,
                 "steps": 0, "batches": 0, "positions_trained": 0,
                 "positions_generated": int(positions_generated or 0),
-                "sample_reuse": 0.0, "sample_size": 0}
+                "sample_reuse": 0.0, "sample_size": 0,
+                "moves_left_loss": None, "moves_left_head": False,
+                "learning_rate": float(_lr_at_step(
+                    cfg, int(optimizer_steps_total or 0)))}
     sample_size = min(
         n,
         int(getattr(cfg, "train_epoch_size", 0)
@@ -907,13 +1025,27 @@ def _epoch_train(cfg, net, optimizer, buffer, device, scaler=None, *,
         return {"policy_loss": 0.0, "value_loss": 0.0, "entropy": 0.0,
                 "steps": 0, "batches": 0, "positions_trained": 0,
                 "positions_generated": int(positions_generated or 0),
-                "sample_reuse": 0.0, "sample_size": 0}
+                "sample_reuse": 0.0, "sample_size": 0,
+                "moves_left_loss": None, "moves_left_head": False,
+                "learning_rate": float(_lr_at_step(
+                    cfg, int(optimizer_steps_total or 0)))}
 
     net.train()
     # NHWC for the conv body: the same memory format the inference runtime
     # uses, and the one cuDNN's FP16 kernels prefer on this hardware.  A
     # channels_last module has identical state_dict keys and values, so
     # checkpoint round-trips are unaffected.
+    last_lr = _lr_at_step(cfg, int(optimizer_steps_total or 0))
+    # Auxiliary moves-left target: only when the net actually has the head AND
+    # the replay carries real labels.  A buffer restored from a pre-auxiliary
+    # snapshot reports has_moves_left False and its all-zero column is never
+    # trained on, rather than teaching the head that every position ends now.
+    use_moves_left = (bool(getattr(net, "has_moves_left", False))
+                      and bool(getattr(buffer, "has_moves_left", False)))
+    ml_weight = float(getattr(cfg, "moves_left_loss_weight", 0.0))
+    ml_scale = float(getattr(cfg, "moves_left_scale", 400.0)) or 1.0
+    sum_moves_left = 0.0
+    ml_loss = None
     channels_last = (bool(getattr(cfg, "train_channels_last", False))
                      and _device_type(device) == "cuda")
     if channels_last:
@@ -942,27 +1074,57 @@ def _epoch_train(cfg, net, optimizer, buffer, device, scaler=None, *,
                         rows[start:start + cfg.train_batch_size], device)
                     for start in range(0, sample_size, cfg.train_batch_size)
                 )
+            slice_start = 0
             for states, pis, zs in batch_iter:
+                # The loader slices `rows` in order, so the rows backing this
+                # batch are recoverable without changing its (states, pis, zs)
+                # contract.  Only needed when the auxiliary head is on.
+                if use_moves_left:
+                    batch_rows = rows[slice_start:slice_start + states.shape[0]]
+                    ml_target = buffer.moves_left_tensor(batch_rows, device)
+                    ml_target = ml_target / float(ml_scale)
+                slice_start += states.shape[0]
+                # Schedule is a pure function of the GLOBAL step count, so a
+                # resumed run picks up the exact rate an uninterrupted one
+                # would have had.  Applied before the step it governs.
+                last_lr = _apply_lr(cfg, optimizer,
+                                    int(optimizer_steps_total or 0) + steps)
                 if channels_last:
                     states = states.contiguous(memory_format=torch.channels_last)
                 if amp:
                     with torch.autocast(device_type=_device_type(device)):
-                        logits, value = net(states)
+                        if use_moves_left:
+                            logits, value, ml = net(states, with_moves_left=True)
+                            ml_loss = F.mse_loss(ml, ml_target)
+                        else:
+                            logits, value = net(states)
+                            ml_loss = None
                         policy_loss = F.cross_entropy(logits, pis)
                         value_loss = F.mse_loss(value, zs)
                         loss = policy_loss + value_loss
+                        if ml_loss is not None:
+                            loss = loss + ml_weight * ml_loss
                     optimizer.zero_grad(set_to_none=True)
                     scaler.scale(loss).backward()
                     scaler.step(optimizer)
                     scaler.update()
                 else:
-                    logits, value = net(states)
+                    if use_moves_left:
+                        logits, value, ml = net(states, with_moves_left=True)
+                        ml_loss = F.mse_loss(ml, ml_target)
+                    else:
+                        logits, value = net(states)
+                        ml_loss = None
                     policy_loss = F.cross_entropy(logits, pis)
                     value_loss = F.mse_loss(value, zs)
                     loss = policy_loss + value_loss
+                    if ml_loss is not None:
+                        loss = loss + ml_weight * ml_loss
                     optimizer.zero_grad(set_to_none=True)
                     loss.backward()
                     optimizer.step()
+                if ml_loss is not None:
+                    sum_moves_left += float(ml_loss.item())
                 probs = F.softmax(logits.float(), dim=1)
                 entropy = -(probs * (probs + 1e-12).log()).sum(dim=1).mean()
                 sum_policy += float(policy_loss.item())
@@ -986,6 +1148,9 @@ def _epoch_train(cfg, net, optimizer, buffer, device, scaler=None, *,
         "positions_trained": positions_trained,
         "positions_generated": gen,
         "sample_reuse": (positions_trained / gen) if gen > 0 else 0.0,
+        "learning_rate": float(last_lr),
+        "moves_left_loss": (sum_moves_left / batches) if use_moves_left else None,
+        "moves_left_head": bool(use_moves_left),
     }
     try:
         telemetry.safe_emit(cfg, {
@@ -1008,6 +1173,11 @@ def _epoch_train(cfg, net, optimizer, buffer, device, scaler=None, *,
             "steps_per_iteration": result["steps"],
             "steps_per_second": (result["steps"] / _train_timer.duration_s
                                  if _train_timer.duration_s else None),
+            "learning_rate": result["learning_rate"],
+            "lr_schedule": str(getattr(cfg, "lr_schedule", "none")),
+            "optimizer_kind": str(getattr(cfg, "optimizer", "adam")),
+            "moves_left_loss": result["moves_left_loss"],
+            "moves_left_head": result["moves_left_head"],
             "policy_loss": result["policy_loss"],
             "value_loss": result["value_loss"],
             "entropy": result["entropy"],
@@ -1063,8 +1233,15 @@ def _arena_gate(cfg, net, best_net, *, run_id=None, iteration=None,
     losses = int(result["b"])
     draws = int(result["draws"])
     games = wins + losses + draws
-    score = (wins + 0.5 * draws) / games if games else 0.0
-    accepted = score >= float(getattr(cfg, "arena_accept_threshold", 0.55))
+    decision = stats.promotion_decision(
+        wins, draws, losses,
+        threshold=float(getattr(cfg, "arena_accept_threshold", 0.55)),
+        confidence=float(getattr(cfg, "arena_confidence", 0.95)),
+        require_lower_bound=bool(
+            getattr(cfg, "arena_require_lower_bound", True)),
+    )
+    score = decision["score"]
+    accepted = bool(decision["accepted"])
     try:
         telemetry.safe_emit(cfg, {
             "type": "phase",
@@ -1080,6 +1257,15 @@ def _arena_gate(cfg, net, best_net, *, run_id=None, iteration=None,
             "losses": losses,
             "score": score,
             "accepted": accepted,
+            "score_ci_low": decision["low"],
+            "score_ci_high": decision["high"],
+            "score_ci_low_empirical": decision["emp_low"],
+            "score_ci_high_empirical": decision["emp_high"],
+            "score_std_error": decision["std_error"],
+            "arena_confidence": decision["confidence"],
+            "require_lower_bound": decision["require_lower_bound"],
+            "point_estimate_pass": decision["point_pass"],
+            "lower_bound_pass": decision["lower_bound_pass"],
             "opening_seed": opening_seed,
             "opening_pairs": num_pairs,
             "opening_suite_hash": suite_hash,
@@ -1187,6 +1373,10 @@ def run(cfg=None, resume=False, on_iteration=None, warm_start_checkpoint=None):
 
     _seed_all(cfg.seed)
     os.makedirs(cfg.checkpoint_dir, exist_ok=True)
+    # Fail fast on a replay capacity that will not fit: the buffer is resident
+    # for the whole run and embedded in every resumable snapshot, so an
+    # over-large capacity otherwise surfaces hours in, mid-checkpoint-write.
+    _replay_estimate = preflight_replay_capacity(cfg)
     device = getattr(cfg, "device", "cpu")
 
     net = ChessNet(cfg).to(device)
@@ -1410,6 +1600,10 @@ def run_parallel(cfg=None, resume=False, num_workers=None, on_iteration=None,
 
     _seed_all(cfg.seed)
     os.makedirs(cfg.checkpoint_dir, exist_ok=True)
+    # Fail fast on a replay capacity that will not fit: the buffer is resident
+    # for the whole run and embedded in every resumable snapshot, so an
+    # over-large capacity otherwise surfaces hours in, mid-checkpoint-write.
+    _replay_estimate = preflight_replay_capacity(cfg)
     device = getattr(cfg, "device", "cpu")
 
     # ---- model / optimizer / resume (same semantics as serial run) ----
@@ -1675,6 +1869,10 @@ def run_native(cfg=None, resume=False, on_iteration=None,
 
     _seed_all(cfg.seed)
     os.makedirs(cfg.checkpoint_dir, exist_ok=True)
+    # Fail fast on a replay capacity that will not fit: the buffer is resident
+    # for the whole run and embedded in every resumable snapshot, so an
+    # over-large capacity otherwise surfaces hours in, mid-checkpoint-write.
+    _replay_estimate = preflight_replay_capacity(cfg)
     device = getattr(cfg, "device", "cpu")
 
     net = ChessNet(cfg).to(device)
