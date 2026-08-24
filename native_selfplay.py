@@ -17,6 +17,9 @@ handle so a stale game can never be mislabelled as new-generation data.
 
 from __future__ import annotations
 
+import os
+import queue
+import threading
 import time
 from typing import Callable, List, Optional, Tuple
 
@@ -259,6 +262,338 @@ class NativeSelfPlay:
             pass
 
 
+class _InferenceService:
+    """Serialises every GPU call onto ONE dedicated thread.
+
+    A plain lock around the runtime is not enough.  ``torch.compile(mode=
+    "reduce-overhead")`` runs the forward pass through CUDA graph trees, and
+    the graph manager lives in THREAD-LOCAL storage — calling the compiled
+    function from a second thread trips
+    ``assert torch._C._is_key_in_tls("tree_manager_containers")`` deep inside
+    inductor's cudagraph_trees.  Pinning all inference to a single owner
+    thread keeps the compiled path usable while still overlapping: the shard
+    threads descend their trees while this thread drives the GPU.
+
+    Requests are served strictly FIFO, one at a time, so each shard sees
+    exactly the results it would have seen in the serial loop.
+    """
+
+    _STOP = object()
+
+    def __init__(self, inference_fn: InferenceFn):
+        self.inference_fn = inference_fn
+        self.queue: "queue.Queue" = queue.Queue()
+        self.busy_s = 0.0
+        self.calls = 0
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
+
+    def _loop(self) -> None:
+        while True:
+            item = self.queue.get()
+            if item is self._STOP:
+                return
+            inputs, offsets, indices, box = item
+            t0 = time.perf_counter()
+            try:
+                box["result"] = self.inference_fn(inputs, offsets, indices)
+            except BaseException as exc:  # noqa: BLE001 - handed to the caller
+                box["error"] = exc
+            finally:
+                self.busy_s += time.perf_counter() - t0
+                self.calls += 1
+                box["event"].set()
+
+    def submit(self, inputs, offsets, indices):
+        """Blocking call: enqueue a batch and wait for its result."""
+        box = {"event": threading.Event(), "result": None, "error": None}
+        self.queue.put((inputs, offsets, indices, box))
+        box["event"].wait()
+        if box["error"] is not None:
+            raise box["error"]
+        return box["result"]
+
+    def close(self) -> None:
+        self.queue.put(self._STOP)
+        self._thread.join(timeout=30)
+
+    def mark(self) -> float:
+        """Current cumulative busy seconds, for per-round deltas."""
+        return self.busy_s
+
+
+class ShardedSelfPlay:
+    """Self-play with CPU tree descent and GPU inference OVERLAPPED.
+
+    The single-actor loop is strictly serial: gather -> evaluate -> apply ->
+    advance.  While the C++ threads descend the trees the GPU has nothing
+    queued, and while the GPU runs the forward pass every C++ thread is parked
+    in join().  Measured on this machine the descent was ~78-93% of the round
+    and inference ~15-17%, with neither overlapping the other.
+
+    Here the games are split into ``shards`` independent actors, each driven by
+    its own Python thread.  A lock serialises GPU access (InferenceRuntime is
+    explicitly not thread-safe), so while one shard holds the GPU the others
+    are descending.  The native bindings release the GIL around gather_leaves,
+    apply_evaluations and advance, without which those Python threads would
+    simply queue on the interpreter lock and nothing would overlap.
+
+    Determinism
+    -----------
+    Each shard's actor is seeded independently and its search depends only on
+    its own leaf evaluations, so a shard's games do not depend on how its GPU
+    calls interleave with other shards'.  Finished games are concatenated in
+    SHARD ORDER, so the returned example list is deterministic even though the
+    threads finish in arbitrary order.  ``shards == 1`` uses the round seed
+    directly and is byte-identical to NativeSelfPlay.
+    """
+
+    def __init__(
+        self,
+        cfg,
+        inference_fn: InferenceFn,
+        games: Optional[int] = None,
+        shards: Optional[int] = None,
+        weight_version: int = 0,
+        generation: int = 0,
+        seed: Optional[int] = None,
+        run_id: Optional[str] = None,
+        iteration: Optional[int] = None,
+    ):
+        self.cfg = cfg
+        self.inference_fn = inference_fn
+        self.weight_version = int(weight_version)
+        self.generation = int(generation)
+        self.run_id = run_id
+        self.iteration = iteration
+
+        if games is not None:
+            total = int(games)
+        else:
+            in_flight = getattr(cfg, "selfplay_games_in_flight", None)
+            total = int(in_flight if in_flight else cfg.games_per_iteration)
+        if total <= 0:
+            raise ValueError("games must be positive")
+        self.games = total
+
+        n_shards = shards if shards is not None else getattr(
+            cfg, "selfplay_shards", 2)
+        self.shards = max(1, min(int(n_shards or 1), total))
+
+        self.round_seed = int(seed) if seed is not None else int(cfg.seed)
+        self.max_batch = int(getattr(cfg, "selfplay_max_batch", 256))
+        self.leaves_per_game = int(
+            getattr(cfg, "selfplay_leaves_per_game", 0) or 0)
+
+        # Split games as evenly as possible; earlier shards take the remainder.
+        base, rem = divmod(total, self.shards)
+        self._shard_games = [base + (1 if i < rem else 0)
+                             for i in range(self.shards)]
+
+        # Actor worker threads are a machine-wide resource: divide the budget
+        # across shards rather than giving every shard the whole CPU.
+        cfg_threads = getattr(cfg, "selfplay_actor_threads", None)
+        hw = os.cpu_count() or 1
+        budget = int(cfg_threads) if cfg_threads else hw
+        per_shard_threads = max(1, budget // self.shards)
+
+        self.actors = []
+        for i, g in enumerate(self._shard_games):
+            # shards == 1 must reproduce NativeSelfPlay exactly, so the single
+            # actor gets the round seed unchanged rather than a derived one.
+            shard_seed = (self.round_seed if self.shards == 1
+                          else derive_selfplay_seed(self.round_seed, i + 1))
+            actor = native.Actor(
+                games=g,
+                c_puct=float(cfg.c_puct),
+                virtual_loss=float(cfg.virtual_loss),
+                num_simulations=int(cfg.num_simulations),
+                temperature=float(cfg.temperature),
+                temperature_threshold=int(cfg.temperature_threshold),
+                max_game_length=int(cfg.max_game_length),
+                seed=shard_seed,
+                num_threads=min(per_shard_threads, g),
+            )
+            actor.set_teacher(self.weight_version, self.generation)
+            self.actors.append(actor)
+
+        # Backwards-compatible handle for callers that read sp.actor.
+        self.actor = self.actors[0]
+
+        # ---- merged round telemetry ----
+        self.gather_s = self.apply_s = self.advance_s = 0.0
+        self.infer_s = 0.0
+        self.gather_calls = self.apply_calls = 0
+        self.advance_calls = self.inference_calls = 0
+        self.simulations = 0
+        self.batch_b: List[int] = []
+        self.batch_stats: dict = {}
+        self.trajectory_hashes: List[str] = []
+        self.round_duration_s = 0.0
+        self.gpu_busy_s = 0.0
+
+    # ------------------------------------------------------------------ #
+
+    def _drive(self, index: int, stats: dict) -> None:
+        """One shard's driver loop; runs on its own Python thread."""
+        actor = self.actors[index]
+        while not actor.is_done():
+            t0 = time.perf_counter()
+            tokens, inputs, offsets, indices = actor.gather_leaves(
+                self.max_batch, self.leaves_per_game)
+            t1 = time.perf_counter()
+            stats["gather_s"] += t1 - t0
+            stats["gather_calls"] += 1
+            if len(tokens) == 0:
+                actor.advance()
+                stats["advance_calls"] += 1
+                stats["advance_s"] += time.perf_counter() - t1
+                continue
+            stats["batch_b"].append(int(len(tokens)))
+
+            # All GPU work goes through the single inference thread.  The
+            # wall time spent here includes queueing behind another shard —
+            # which is precisely the overlap signal: waiting means the GPU
+            # was already busy with someone else's batch.
+            acquired = time.perf_counter()
+            logits, values = self._service.submit(inputs, offsets, indices)
+            done = time.perf_counter()
+            stats["infer_s"] += done - acquired
+            stats["inference_calls"] += 1
+
+            t2 = time.perf_counter()
+            actor.apply_evaluations(tokens, offsets, logits, values)
+            t3 = time.perf_counter()
+            stats["apply_s"] += t3 - t2
+            stats["apply_calls"] += 1
+            actor.advance()
+            stats["advance_s"] += time.perf_counter() - t3
+            stats["advance_calls"] += 1
+            stats["simulations"] += int(self.cfg.num_simulations)
+
+    def run(self, max_batch: Optional[int] = None,
+            leaves_per_game: Optional[int] = None
+            ) -> List[Tuple[np.ndarray, np.ndarray, float]]:
+        """Drive every shard concurrently; return replay examples in shard order."""
+        if max_batch is not None:
+            self.max_batch = int(max_batch)
+        if leaves_per_game is not None:
+            self.leaves_per_game = int(leaves_per_game)
+
+        # Reuse the runtime's long-lived serving thread when there is one.
+        # A fresh thread per round would break torch.compile's CUDA graph
+        # trees all over again: their manager is thread-local, so the first
+        # compiled call on a NEW thread trips the inductor TLS assertion.
+        shared = getattr(self.inference_fn, "_service", None)
+        if shared is not None:
+            self._service = shared
+            self._owns_service = False
+        else:
+            self._service = _InferenceService(self.inference_fn)
+            self._owns_service = True
+        busy_before = self._service.mark()
+        per_shard = [
+            {"gather_s": 0.0, "apply_s": 0.0, "advance_s": 0.0,
+             "infer_s": 0.0, "gather_calls": 0,
+             "apply_calls": 0, "advance_calls": 0, "inference_calls": 0,
+             "simulations": 0, "batch_b": []}
+            for _ in range(self.shards)
+        ]
+        errors: List[BaseException] = []
+        error_lock = threading.Lock()
+
+        def target(i):
+            try:
+                self._drive(i, per_shard[i])
+            except BaseException as exc:  # noqa: BLE001 - re-raised below
+                with error_lock:
+                    errors.append(exc)
+
+        t_round = time.perf_counter()
+        try:
+            threads = [threading.Thread(target=target, args=(i,), daemon=True)
+                       for i in range(self.shards)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+        finally:
+            self.gpu_busy_s = self._service.mark() - busy_before
+            if self._owns_service:
+                self._service.close()
+        self.round_duration_s = time.perf_counter() - t_round
+        if errors:
+            raise errors[0]
+
+        for st in per_shard:
+            self.gather_s += st["gather_s"]
+            self.apply_s += st["apply_s"]
+            self.advance_s += st["advance_s"]
+            self.infer_s += st["infer_s"]
+            self.gather_calls += st["gather_calls"]
+            self.apply_calls += st["apply_calls"]
+            self.advance_calls += st["advance_calls"]
+            self.inference_calls += st["inference_calls"]
+            self.simulations += st["simulations"]
+            self.batch_b.extend(st["batch_b"])
+        self.batch_stats = telemetry._percentiles(self.batch_b)
+
+        # Shard order, then the actor's own game order: deterministic despite
+        # the threads finishing in whatever order they finish.
+        examples: List[Tuple[np.ndarray, np.ndarray, float]] = []
+        for actor in self.actors:
+            for game in actor.finished_games():
+                for state, pi, z in game["examples"]:
+                    examples.append((state, pi, z))
+                self.trajectory_hashes.append(
+                    telemetry.game_trajectory_hash(game["examples"])
+                )
+        self._emit_round_telemetry(len(examples))
+        return examples
+
+    # ------------------------------------------------------------------ #
+
+    @property
+    def gpu_busy_fraction(self) -> float:
+        """Share of the round during which the GPU held a batch.
+
+        This is the number the overlap work exists to raise: in the serial
+        loop it is bounded by the inference share of one thread's timeline.
+        """
+        if self.round_duration_s <= 0:
+            return 0.0
+        return self.gpu_busy_s / self.round_duration_s
+
+    def _emit_round_telemetry(self, examples: int) -> None:
+        try:
+            telemetry.safe_emit(self.cfg, {
+                "type": "phase",
+                "phase": "selfplay_sharded",
+                "run_id": self.run_id,
+                "iteration": self.iteration,
+                "generation": self.generation,
+                "duration_s": self.round_duration_s,
+                "shards": self.shards,
+                "shard_games": list(self._shard_games),
+                "games": self.games,
+                "examples": examples,
+                "gather_s": self.gather_s,
+                "apply_s": self.apply_s,
+                "advance_s": self.advance_s,
+                "infer_s": self.infer_s,
+                "gpu_busy_s": self.gpu_busy_s,
+                "gpu_busy_fraction": self.gpu_busy_fraction,
+                "inference_calls": self.inference_calls,
+                "gather_calls": self.gather_calls,
+                "simulations": self.simulations,
+                "leaves_per_game": self.leaves_per_game,
+                "max_batch": self.max_batch,
+                **self.batch_stats,
+            })
+        except Exception:  # noqa: BLE001 - telemetry must never kill training
+            pass
+
+
 def make_gpu_inference_fn(cfg, model=None):
     """Return an ``InferenceRuntime.evaluate``-compatible callback.
 
@@ -270,12 +605,26 @@ def make_gpu_inference_fn(cfg, model=None):
 
     runtime = InferenceRuntime(cfg=cfg, model=model)
 
-    def evaluate(inputs, legal_offsets, legal_indices):
+    def _raw_evaluate(inputs, legal_offsets, legal_indices):
         return runtime.evaluate(inputs, legal_offsets, legal_indices)
+
+    # One serving thread for the runtime's whole life.  Every GPU call — from
+    # any number of self-play shards — is executed on it, which both honours
+    # "InferenceRuntime is not thread-safe" and keeps torch.compile's
+    # thread-local CUDA graph state valid.
+    service = _InferenceService(_raw_evaluate)
+
+    def evaluate(inputs, legal_offsets, legal_indices):
+        return service.submit(inputs, legal_offsets, legal_indices)
 
     def update_weights(state_dict):
         runtime.model.load_state_dict(state_dict)
 
+    def close():
+        service.close()
+
     evaluate.update_weights = update_weights  # type: ignore[attr-defined]
-    evaluate.runtime = runtime  # type: ignore[attr-defined]
+    evaluate.runtime = runtime                # type: ignore[attr-defined]
+    evaluate._service = service               # type: ignore[attr-defined]
+    evaluate.close = close                    # type: ignore[attr-defined]
     return evaluate

@@ -1,0 +1,80 @@
+{
+  "arch": "v2-6x128",
+  "games": 32,
+  "sims": 100,
+  "rows": [
+    {
+      "shards": 1,
+      "shard_games": [
+        32
+      ],
+      "games": 32,
+      "wall_s": 36.93571279698517,
+      "games_per_hour": 3118.932633930461,
+      "examples": 1796,
+      "gpu_busy_s": 5.101263635326177,
+      "gpu_busy_fraction": 0.13865596022561008,
+      "gather_s": 30.613330530788517,
+      "infer_s": 5.1851452429255005,
+      "apply_s": 0.26017281599342823,
+      "advance_s": 0.7222752884845249,
+      "inference_calls": 600,
+      "batch_mean": 301.71666666666664,
+      "batch_p50": 360.0,
+      "gpu_util_mean": 9.934640522875817,
+      "gpu_util_max": 23.0,
+      "gpu_power_mean_w": 60.305816993464056,
+      "gpu_samples": 153
+    },
+    {
+      "shards": 2,
+      "shard_games": [
+        16,
+        16
+      ],
+      "games": 32,
+      "wall_s": 33.88242679499672,
+      "games_per_hour": 3399.9925889904416,
+      "examples": 1739,
+      "gpu_busy_s": 6.381899662519572,
+      "gpu_busy_fraction": 0.18914586089741395,
+      "gather_s": 56.399608819163404,
+      "infer_s": 6.997294838918606,
+      "apply_s": 1.2442937768646516,
+      "advance_s": 1.7528914723952767,
+      "inference_calls": 1200,
+      "batch_mean": 145.69166666666666,
+      "batch_p50": 168.0,
+      "gpu_util_mean": 11.181818181818182,
+      "gpu_util_max": 27.0,
+      "gpu_power_mean_w": 62.846643356643355,
+      "gpu_samples": 143
+    },
+    {
+      "shards": 4,
+      "shard_games": [
+        8,
+        8,
+        8,
+        8
+      ],
+      "games": 32,
+      "wall_s": 38.514667496987386,
+      "games_per_hour": 2991.068273119869,
+      "examples": 1836,
+      "gpu_busy_s": 14.583471071586246,
+      "gpu_busy_fraction": 0.37991668314736904,
+      "gather_s": 124.28442902863026,
+      "infer_s": 19.010999044723576,
+      "apply_s": 3.2921616577077657,
+      "advance_s": 4.659528690302977,
+      "inference_calls": 2400,
+      "batch_mean": 77.05166666666666,
+      "batch_p50": 96.0,
+      "gpu_util_mean": 11.335443037974683,
+      "gpu_util_max": 29.0,
+      "gpu_power_mean_w": 63.88436708860759,
+      "gpu_samples": 158
+    }
+  ]
+}

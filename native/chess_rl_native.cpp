@@ -148,6 +148,9 @@ void mcts_apply_evaluations(
                                     logits_arr.data() + logits_arr.size());
     const std::vector<float> values(values_arr.data(),
                                     values_arr.data() + values_arr.size());
+    // Arrays are copied into owned vectors above (GIL held); the backprop
+    // itself touches no Python objects.
+    py::gil_scoped_release nogil;
     self.apply_evaluations(tokens, offsets, logits, values);
 }
 
@@ -161,8 +164,16 @@ void mcts_apply_evaluations(
 // merged pending list.
 py::tuple actor_gather_leaves(Actor& self, int max_batch,
                               int leaves_per_game) {
-    const Actor::GatherResult result =
-        self.gather_leaves(max_batch, leaves_per_game);
+    // The tree descent is pure C++ and takes the overwhelming majority of the
+    // call.  Releasing the GIL around it lets several Python driver threads
+    // (one per actor shard) descend concurrently while another holds the GPU,
+    // which is what makes CPU/GPU overlap possible at all.  The numpy arrays
+    // below are built after the GIL is reacquired.
+    Actor::GatherResult result;
+    {
+        py::gil_scoped_release nogil;
+        result = self.gather_leaves(max_batch, leaves_per_game);
+    }
     const int B = static_cast<int>(result.leaves.size());
 
     std::vector<int> tokens(static_cast<std::size_t>(B));
@@ -201,6 +212,9 @@ void actor_apply_evaluations(
                                     logits_arr.data() + logits_arr.size());
     const std::vector<float> values(values_arr.data(),
                                     values_arr.data() + values_arr.size());
+    // Arrays are copied into owned vectors above (GIL held); the backprop
+    // itself touches no Python objects.
+    py::gil_scoped_release nogil;
     self.apply_evaluations(tokens, offsets, logits, values);
 }
 
@@ -330,7 +344,8 @@ PYBIND11_MODULE(_chess_rl_native, module) {
         .def("apply_evaluations", &actor_apply_evaluations, py::arg("tokens"),
              py::arg("legal_offsets"), py::arg("legal_logits"),
              py::arg("values"))
-        .def("advance", &Actor::advance)
+        .def("advance", &Actor::advance,
+             py::call_guard<py::gil_scoped_release>())
         .def("finished_games", &actor_finished_games)
         .def("is_done", &Actor::is_done)
         .def("games_remaining", &Actor::games_remaining)
