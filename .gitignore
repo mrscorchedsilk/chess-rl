@@ -21,3 +21,6 @@ evidence/
 # shared venv so the live v2 lineage keeps its own pinned native module
 /_pkg/
 /devenv.sh
+
+# arena benchmark telemetry run artifacts
+benchmarks/results/arena-telemetry-*.jsonl

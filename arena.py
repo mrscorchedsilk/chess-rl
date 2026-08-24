@@ -20,6 +20,7 @@ import random
 import chess
 
 from mcts import MCTS
+import telemetry
 
 
 def _terminal_result(board):
@@ -134,6 +135,10 @@ def play_match(net_a, net_b, cfg, num_games, openings=None):
     nets face every opening from both sides.  Returns
     {'a': wins_a, 'b': wins_b, 'draws': draws}, unchanged.
     """
+    if getattr(cfg, "arena_backend", "python") == "native":
+        from native_arena import play_match as _native_play_match
+        return _native_play_match(net_a, net_b, cfg, num_games, openings)
+    # ---- existing python path, unchanged from here on ----
     if num_games % 2 != 0:
         raise ValueError(f"arena_games must be even (got {num_games})")
     mcts_a = MCTS(net_a, cfg)
@@ -148,29 +153,42 @@ def play_match(net_a, net_b, cfg, num_games, openings=None):
             int(getattr(cfg, "arena_seed", 424242)),
         )
 
-    for opening_moves in openings:
-        # Game A: candidate (net_a) White, champion (net_b) Black.
-        white_result = _play_arena_game(
-            mcts_a, mcts_b, cfg, num_sims=cfg.arena_simulations,
-            opening_moves=opening_moves,
-        )
-        if white_result > 0.0:
-            wins_a += 1
-        elif white_result < 0.0:
-            wins_b += 1
-        else:
-            draws += 1
+    # Telemetry is a pure SIDE EFFECT: the match loop and the return contract
+    # {"a","b","draws"} are unchanged (existing tests pin the contract).
+    with telemetry.PhaseTimer("arena") as _arena_timer:
+        for opening_moves in openings:
+            # Game A: candidate (net_a) White, champion (net_b) Black.
+            white_result = _play_arena_game(
+                mcts_a, mcts_b, cfg, num_sims=cfg.arena_simulations,
+                opening_moves=opening_moves,
+            )
+            if white_result > 0.0:
+                wins_a += 1
+            elif white_result < 0.0:
+                wins_b += 1
+            else:
+                draws += 1
 
-        # Game B: colors swapped.
-        white_result = _play_arena_game(
-            mcts_b, mcts_a, cfg, num_sims=cfg.arena_simulations,
-            opening_moves=opening_moves,
-        )
-        if white_result > 0.0:
-            wins_b += 1
-        elif white_result < 0.0:
-            wins_a += 1
-        else:
-            draws += 1
+            # Game B: colors swapped.
+            white_result = _play_arena_game(
+                mcts_b, mcts_a, cfg, num_sims=cfg.arena_simulations,
+                opening_moves=opening_moves,
+            )
+            if white_result > 0.0:
+                wins_b += 1
+            elif white_result < 0.0:
+                wins_a += 1
+            else:
+                draws += 1
+    try:
+        telemetry.safe_emit(cfg, {
+            "type": "phase",
+            "phase": "arena",
+            "duration_s": _arena_timer.duration_s,
+            "arena_games": int(num_games),
+            "arena_sims": int(getattr(cfg, "arena_simulations", 0)),
+        })
+    except Exception:  # noqa: BLE001 - telemetry must never kill training
+        pass
 
     return {"a": wins_a, "b": wins_b, "draws": draws}

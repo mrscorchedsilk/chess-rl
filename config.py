@@ -87,6 +87,20 @@ class Config:
     # varied.  Temperature stays 0 and root noise stays off.
     arena_seed = 424242
     arena_opening_plies = 8
+    # Search backend for the arena gate: "python" (arena.py + mcts.py,
+    # unchanged default) or "native" (native_arena.py + chess_rl_native.MCTS;
+    # see docs/native-arena-design.md).  Game semantics (paired openings,
+    # color swap, temp 0, no root noise, score/threshold) are identical.
+    arena_backend = "python"
+
+    # ---- permanent phase telemetry (Ticket A; see docs/telemetry-design.md) ----
+    # Swallow-guarded + semantic-free, so leaving it on is safe: no extra
+    # forward passes, no RNG draws, no data mutation — replay examples, move
+    # choices, checkpoints and scores are bit-identical with it on vs off.
+    telemetry_enabled = True          # global on/off for the JSONL emitter
+    telemetry_path = None             # None -> <checkpoint_dir>/telemetry.jsonl
+    telemetry_resource_every = 1      # emit a `resource` record every N iterations
+    telemetry_diversity_every = arena_every  # replay-buffer diversity audit cadence
 
     # ---- misc ----
     max_game_length = 400       # plies hard cap -> draw

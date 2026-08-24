@@ -17,11 +17,13 @@ handle so a stale game can never be mislabelled as new-generation data.
 
 from __future__ import annotations
 
+import time
 from typing import Callable, List, Optional, Tuple
 
 import numpy as np
 
 import chess_rl_native as native
+import telemetry
 
 # Inference callback: (inputs, legal_offsets, legal_indices) -> (legal_logits, values).
 InferenceFn = Callable[
@@ -70,12 +72,16 @@ class NativeSelfPlay:
         weight_version: int = 0,
         generation: int = 0,
         seed: Optional[int] = None,
+        run_id: Optional[str] = None,
+        iteration: Optional[int] = None,
     ):
         self.cfg = cfg
         self.inference_fn = inference_fn
         self.games = int(games if games is not None else cfg.games_per_iteration)
         self.weight_version = int(weight_version)
         self.generation = int(generation)
+        self.run_id = run_id
+        self.iteration = iteration
         # One explicit base seed per self-play ROUND.  The trainer derives this
         # from (cfg.seed, iteration) via derive_selfplay_seed so each iteration
         # plays genuinely new games; the C++ Actor then derives distinct
@@ -95,21 +101,106 @@ class NativeSelfPlay:
         )
         self.actor.set_teacher(self.weight_version, self.generation)
 
+        # ---- round telemetry (Ticket A; semantic-free counters) ----
+        # Accumulated inside run(); exposed so the trainer can merge them into
+        # the `selfplay` phase record.  All values derive from data this class
+        # already holds — the inference fn stays a pure injected callback.
+        self.gather_calls = 0
+        self.apply_calls = 0
+        self.advance_calls = 0
+        self.gather_s = 0.0
+        self.apply_s = 0.0
+        self.advance_s = 0.0
+        self.batch_b: List[int] = []          # B per non-empty gather
+        self.inference_calls = 0
+        self.simulations = 0
+        self.round_duration_s = 0.0
+        self.trajectory_hashes: List[str] = []  # one BLAKE2 digest per game
+        self.batch_stats = telemetry._percentiles(self.batch_b)
+
     def run(self, max_batch: int = 256) -> List[Tuple[np.ndarray, np.ndarray, float]]:
         """Drive gather/apply/advance to completion; return replay examples."""
         examples: List[Tuple[np.ndarray, np.ndarray, float]] = []
+        t_round = time.perf_counter()
         while not self.actor.is_done():
+            t0 = time.perf_counter()
             tokens, inputs, offsets, indices = self.actor.gather_leaves(max_batch)
+            self.gather_s += time.perf_counter() - t0
+            self.gather_calls += 1
             if len(tokens) == 0:
+                t_adv = time.perf_counter()
                 self.actor.advance()
+                self.advance_s += time.perf_counter() - t_adv
+                self.advance_calls += 1
                 continue
+            self.batch_b.append(int(len(tokens)))
+            self.inference_calls += 1
             logits, values = self.inference_fn(inputs, offsets, indices)
+            t_apply = time.perf_counter()
             self.actor.apply_evaluations(tokens, offsets, logits, values)
+            self.apply_s += time.perf_counter() - t_apply
+            self.apply_calls += 1
+            t_adv = time.perf_counter()
             self.actor.advance()
+            self.advance_s += time.perf_counter() - t_adv
+            self.advance_calls += 1
+            self.simulations += int(self.cfg.num_simulations)
+        self.round_duration_s = time.perf_counter() - t_round
+        self.batch_stats = telemetry._percentiles(self.batch_b)
         for game in self.actor.finished_games():
             for state, pi, z in game["examples"]:
                 examples.append((state, pi, z))
+            # Generation-time trajectory identity: one BLAKE2 digest over the
+            # game's ORDERED (state, pi, z) examples (design §2.3).
+            self.trajectory_hashes.append(
+                telemetry.game_trajectory_hash(game["examples"])
+            )
+        self._emit_round_telemetry(len(examples))
         return examples
+
+    def _emit_round_telemetry(self, n_examples: int) -> None:
+        """Emit the ``gather_apply_advance`` phase + ``selfplay_round``
+        diversity records (design §3.2).  Swallow-guarded: never affects
+        training or game semantics."""
+        try:
+            telemetry.safe_emit(self.cfg, {
+                "type": "phase",
+                "phase": "gather_apply_advance",
+                "run_id": self.run_id,
+                "iteration": self.iteration,
+                "generation": self.generation,
+                "duration_s": self.round_duration_s,
+                "gather_calls": self.gather_calls,
+                "apply_calls": self.apply_calls,
+                "advance_calls": self.advance_calls,
+                "gather_s": self.gather_s,
+                "apply_s": self.apply_s,
+                "advance_s": self.advance_s,
+                "inference_calls": self.inference_calls,
+                "simulations": self.simulations,
+                **self.batch_stats,
+            })
+        except Exception:  # noqa: BLE001 - telemetry must never kill training
+            pass
+        try:
+            counts = {}
+            for h in self.trajectory_hashes:
+                counts[h] = counts.get(h, 0) + 1
+            telemetry.safe_emit(self.cfg, {
+                "type": "diversity",
+                "source": "selfplay_round",
+                "run_id": self.run_id,
+                "iteration": self.iteration,
+                "generation": self.generation,
+                "replay_size": int(n_examples),
+                "unique_trajectory_hashes": len(counts),
+                "most_repeated_trajectory_count": (
+                    max(counts.values()) if counts else 0
+                ),
+                "trajectory_hashes": list(counts.keys())[:32],
+            })
+        except Exception:  # noqa: BLE001 - telemetry must never kill training
+            pass
 
 
 def make_gpu_inference_fn(cfg, model=None):
