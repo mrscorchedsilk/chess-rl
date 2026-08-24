@@ -1,0 +1,25 @@
+{
+  "games": 64,
+  "shards": 2,
+  "max_ply": 60,
+  "rows": [
+    {
+      "arch": "v2-6x128",
+      "params": 2170218,
+      "steps_per_iteration": 72,
+      "ms_per_step": 15.783515041726382,
+      "train_samples_per_s": 15839.31078337638,
+      "train_peak_vram_gb": 0.23839744,
+      "selfplay_wall_s": 66.97121512901504,
+      "games_per_hour": 3440.2840019574323,
+      "gpu_busy_fraction": 0.17560062262130943,
+      "selfplay_batch_mean": 303.9166666666667,
+      "inference_calls": 1200,
+      "positions_per_s": 5445.623157612307,
+      "gpu_util_mean": 10.261029411764707,
+      "gpu_util_max": 34.0,
+      "gpu_power_mean_w": 66.79669117647059,
+      "gpu_samples": 272
+    }
+  ]
+}
