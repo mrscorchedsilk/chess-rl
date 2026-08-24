@@ -142,6 +142,11 @@ class Config:
     train_channels_last = True   # NHWC weights+activations for the conv body
     train_prefetch = 1           # PinnedReplayLoader lookahead (0 -> synchronous)
     train_compile = False        # opt-in: torch.compile the training step
+    # Exact colour-flip augmentation (augment.py).  Applied per-minibatch at
+    # SAMPLING time, not at insertion: storing both orientations would halve
+    # the number of distinct positions a given replay capacity retains.
+    # 0.5 flips a random half of each batch.
+    augment_colour_flip = 0.5
 
 
     # ---- arena acceptance gating (new net vs current best) ----

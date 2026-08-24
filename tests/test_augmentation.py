@@ -226,3 +226,81 @@ def test_augment_examples_doubles_the_stream():
     rows = [(state, pi, 0.0)] * 5
     assert len(list(augment.augment_examples(rows))) == 10
     assert len(list(augment.augment_examples(rows, include_original=False))) == 5
+
+
+# --------------------------------------------------------------------------- #
+#  batched torch path (what training actually uses)                           #
+# --------------------------------------------------------------------------- #
+
+def _torch():
+    import torch
+    return torch
+
+
+def _state_batch():
+    return np.stack([np.asarray(native.encode_fen(f)) for f in FENS]
+                    ).astype(np.float32)
+
+
+def test_torch_plane_flip_matches_the_numpy_reference_exactly():
+    torch = _torch()
+    arr = _state_batch()
+    got = augment.flip_planes_batch(torch.from_numpy(arr)).numpy()
+    want = np.stack([augment.flip_planes(a) for a in arr])
+    assert np.array_equal(got, want)
+
+
+def test_torch_policy_flip_matches_the_numpy_reference_exactly():
+    torch = _torch()
+    rng = np.random.default_rng(0)
+    pi = rng.random((6, POLICY_SIZE)).astype(np.float32)
+    got = augment.flip_policy_batch(torch.from_numpy(pi)).numpy()
+    want = np.stack([augment.flip_policy(p) for p in pi])
+    assert np.array_equal(got, want)
+
+
+def test_torch_flip_is_an_involution():
+    torch = _torch()
+    arr = torch.from_numpy(_state_batch())
+    assert torch.equal(augment.flip_planes_batch(
+        augment.flip_planes_batch(arr)), arr)
+
+
+def test_augment_batch_only_touches_masked_rows():
+    torch = _torch()
+    states = torch.from_numpy(_state_batch())
+    pis = torch.from_numpy(
+        np.random.default_rng(1).random((states.shape[0], POLICY_SIZE)
+                                        ).astype(np.float32))
+    mask = torch.zeros(states.shape[0], dtype=torch.bool)
+    mask[1] = True
+    out_s, out_p = augment.augment_batch(states, pis, mask)
+    assert torch.equal(out_s[0], states[0])
+    assert torch.equal(out_p[0], pis[0])
+    assert torch.equal(out_s[1], augment.flip_planes_batch(states[1:2])[0])
+    assert not torch.equal(out_s[1], states[1])
+
+
+def test_augment_batch_leaves_inputs_untouched():
+    torch = _torch()
+    states = torch.from_numpy(_state_batch())
+    pis = torch.zeros((states.shape[0], POLICY_SIZE))
+    original = states.clone()
+    mask = torch.ones(states.shape[0], dtype=torch.bool)
+    augment.augment_batch(states, pis, mask)
+    assert torch.equal(states, original)
+
+
+def test_empty_mask_is_a_no_op_without_copying():
+    torch = _torch()
+    states = torch.from_numpy(_state_batch())
+    pis = torch.zeros((states.shape[0], POLICY_SIZE))
+    mask = torch.zeros(states.shape[0], dtype=torch.bool)
+    out_s, out_p = augment.augment_batch(states, pis, mask)
+    assert out_s is states and out_p is pis
+
+
+def test_wrong_batch_shape_is_rejected():
+    torch = _torch()
+    with pytest.raises(ValueError, match="states"):
+        augment.flip_planes_batch(torch.zeros(2, 12, 8, 8))

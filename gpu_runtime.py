@@ -183,6 +183,7 @@ class InferenceRuntime:
         # ---- forward: torch.compile with a clean eager fallback ---- #
         self._compiled = None
         self.compiled = False
+        self.compile_fallback_reason = None
         if compile:
             try:
                 self._compiled = torch.compile(
@@ -463,6 +464,37 @@ class InferenceRuntime:
     # ------------------------------------------------------------------ #
     #  forward + CSR gather (device side)                                #
     # ------------------------------------------------------------------ #
+    def _run_forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Compiled forward with a permanent, one-time fallback to eager.
+
+        torch.compile(mode="reduce-overhead") drives the forward through CUDA
+        graph trees whose manager lives in thread-local storage.  That is fine
+        for the single serving thread a run actually uses, but it can fail at
+        CALL time rather than at construction — most reproducibly when a second
+        InferenceRuntime is built in the same process, where the new serving
+        thread trips
+        ``assert torch._C._is_key_in_tls("tree_manager_containers")`` inside
+        inductor.
+
+        A long training run must not die for that.  The first such failure
+        switches this runtime to eager permanently and records why; results are
+        unchanged, only the launch overhead differs.
+        """
+        if self._compiled is None:
+            return self._forward_impl(x)
+        try:
+            return self._compiled(x)
+        except Exception as exc:  # noqa: BLE001 - deliberate degradation
+            self._compiled = None
+            self.compiled = False
+            self.compile_fallback_reason = repr(exc)
+            warnings.warn(
+                f"compiled forward failed ({exc!r}); falling back to eager for "
+                "the life of this runtime. Numerics are unchanged.",
+                RuntimeWarning, stacklevel=2,
+            )
+            return self._forward_impl(x)
+
     def forward_device(self, call: _Call) -> Tuple[torch.Tensor, torch.Tensor]:
         """Compiled forward + GPU-side CSR legal-logit gather, no copies.
 
@@ -472,7 +504,7 @@ class InferenceRuntime:
         """
         cur = torch.cuda.current_stream()
         with self._cudnn_eval_scope():
-            logits, values = self._compiled(call.dev_in)  # [bucket,4672] [bucket,1]
+            logits, values = self._run_forward(call.dev_in)
         K = call.K
         if K == 0:
             legal = torch.empty((0,), dtype=torch.float32, device=self.device)

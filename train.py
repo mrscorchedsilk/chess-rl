@@ -61,7 +61,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from config import Config
+from config import ARCHITECTURES, Config
 from model import ChessNet
 from selfplay import play_game
 from arena import play_match, generate_arena_openings, arena_suite_hash
@@ -69,6 +69,7 @@ from parallel import InferenceServer, worker_loop
 from replay import (ReplayBuffer, PinnedReplayLoader,
                     ReplayCapacityError, preflight_replay_capacity)
 import native_selfplay
+import augment
 import stats
 import telemetry
 
@@ -1052,6 +1053,13 @@ def _epoch_train(cfg, net, optimizer, buffer, device, scaler=None, *,
         net.to(memory_format=torch.channels_last)
 
     loader = _train_loader(cfg, buffer, device)
+    # Exact colour-flip augmentation: mirror the board vertically and swap
+    # colours.  Chess has no dihedral symmetry, but this one transform is
+    # exact, so it is free extra data.  Applied per batch rather than stored,
+    # so the replay still holds distinct positions.
+    flip_p = float(getattr(cfg, "augment_colour_flip", 0.0) or 0.0)
+    mirror_index = (augment._mirror_index_tensor(device, torch)
+                    if flip_p > 0.0 else None)
     sum_policy = sum_value = sum_entropy = 0.0
     steps = batches = 0
     amp = scaler is not None and bool(getattr(scaler, "_enabled", False))
@@ -1089,6 +1097,11 @@ def _epoch_train(cfg, net, optimizer, buffer, device, scaler=None, *,
                 # would have had.  Applied before the step it governs.
                 last_lr = _apply_lr(cfg, optimizer,
                                     int(optimizer_steps_total or 0) + steps)
+                if flip_p > 0.0:
+                    flip_mask = torch.rand(states.shape[0],
+                                           device=states.device) < flip_p
+                    states, pis = augment.augment_batch(
+                        states, pis, flip_mask, mirror_index)
                 if channels_last:
                     states = states.contiguous(memory_format=torch.channels_last)
                 if amp:
@@ -2184,6 +2197,44 @@ def build_parser():
     p.add_argument("--games-per-iteration", type=int, default=None)
     p.add_argument("--num-iterations", type=int, default=None)
     p.add_argument("--arena-every", type=int, default=None)
+    p.add_argument(
+        "--architecture", type=str, default=None,
+        choices=sorted(ARCHITECTURES),
+        help="body to train (sets num_res_blocks/num_filters from the "
+             "registry). Weights are NOT portable across architectures — a "
+             "new architecture needs its own --checkpoint-dir.",
+    )
+    p.add_argument("--games-in-flight", type=int, default=None,
+                   help="concurrent self-play games (throughput knob; "
+                        "independent of --games-per-iteration)")
+    p.add_argument("--shards", type=int, default=None,
+                   help="actor shards driven by separate threads (overlap "
+                        "CPU descent with GPU inference); 1 = serial")
+    p.add_argument("--train-epoch-size", type=int, default=None,
+                   help="replay positions drawn per epoch; with batch 256 and "
+                        "3 epochs, 8192 gives 96 optimizer steps/iteration")
+    p.add_argument("--replay-size", type=int, default=None,
+                   help="replay capacity (preflighted against RAM and disk)")
+    p.add_argument("--optimizer", type=str, default=None,
+                   choices=("adamw", "adam", "sgd"),
+                   help="optimizer. NOTE: resuming an existing lineage "
+                        "requires the optimizer it was trained with — the v2 "
+                        "lineage predates this flag and was trained with "
+                        "'adam'.")
+    p.add_argument("--lr-schedule", type=str, default=None,
+                   choices=("none", "cosine", "step"))
+    p.add_argument("--allow-optimizer-change", action="store_true",
+                   help="deliberately resume under a different optimizer "
+                        "(Adam and AdamW share a state_dict layout, so this "
+                        "is otherwise refused)")
+    p.add_argument("--arena-games", type=int, default=None)
+    p.add_argument("--arena-simulations", type=int, default=None)
+    p.add_argument("--moves-left-head", action="store_true",
+                   help="enable the auxiliary moves-left head (changes the "
+                        "state_dict; cannot be toggled mid-lineage)")
+    p.add_argument("--resign", action="store_true",
+                   help="enable calibrated resignation (watch "
+                        "false_resignation_rate in the telemetry)")
     p.add_argument("--checkpoint-dir", type=str, default=None,
                    help="override the checkpoint directory (default: checkpoints/v2)")
     return p
@@ -2193,19 +2244,53 @@ def main(argv=None):
     args = build_parser().parse_args(argv)
 
     # Apply runnable overrides to a Config before dispatch.
+    overrides = (
+        args.num_simulations, args.games_per_iteration, args.num_iterations,
+        args.arena_every, args.checkpoint_dir, args.architecture,
+        args.games_in_flight, args.shards, args.train_epoch_size,
+        args.replay_size, args.arena_games, args.arena_simulations,
+        args.optimizer, args.lr_schedule,
+    )
     cfg = None
-    if any(v is not None for v in (
-            args.num_simulations, args.games_per_iteration,
-            args.num_iterations, args.arena_every, args.checkpoint_dir)):
+    if (any(v is not None for v in overrides) or args.moves_left_head
+            or args.resign or args.allow_optimizer_change):
         cfg = Config()
+        if args.architecture is not None:
+            # Set the body from the registry, not just the label: the label
+            # alone would be overridden by the class defaults and the run
+            # would silently train the wrong shape.
+            cfg.architecture_id = args.architecture
+            cfg.num_res_blocks, cfg.num_filters = ARCHITECTURES[args.architecture]
         if args.num_simulations is not None:
             cfg.num_simulations = args.num_simulations
         if args.games_per_iteration is not None:
             cfg.games_per_iteration = args.games_per_iteration
+        if args.games_in_flight is not None:
+            cfg.selfplay_games_in_flight = args.games_in_flight
+        if args.shards is not None:
+            cfg.selfplay_shards = args.shards
+        if args.train_epoch_size is not None:
+            cfg.train_epoch_size = args.train_epoch_size
+        if args.replay_size is not None:
+            cfg.replay_buffer_size = args.replay_size
         if args.num_iterations is not None:
             cfg.num_iterations = args.num_iterations
         if args.arena_every is not None:
             cfg.arena_every = args.arena_every
+        if args.arena_games is not None:
+            cfg.arena_games = args.arena_games
+        if args.arena_simulations is not None:
+            cfg.arena_simulations = args.arena_simulations
+        if args.moves_left_head:
+            cfg.moves_left_head = True
+        if args.resign:
+            cfg.resign_enabled = True
+        if args.optimizer is not None:
+            cfg.optimizer = args.optimizer
+        if args.lr_schedule is not None:
+            cfg.lr_schedule = args.lr_schedule
+        if args.allow_optimizer_change:
+            cfg.allow_optimizer_change = True
         if args.checkpoint_dir is not None:
             cfg.checkpoint_dir = args.checkpoint_dir
 

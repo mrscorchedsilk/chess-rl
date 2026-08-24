@@ -162,3 +162,76 @@ def augment_examples(examples, include_original: bool = True):
         if include_original:
             yield state, pi, z
         yield flip_example(state, pi, z)
+
+
+# --------------------------------------------------------------------------- #
+#  batched torch implementation (training-time augmentation)                   #
+# --------------------------------------------------------------------------- #
+#
+# Augmenting at SAMPLING time rather than at insertion keeps the replay's
+# capacity measured in distinct positions: storing both orientations would
+# halve the number of real games a given buffer retains, which is the opposite
+# of what a bigger buffer is for.
+
+def _mirror_index_tensor(device, torch_mod):
+    return torch_mod.as_tensor(POLICY_MIRROR, dtype=torch_mod.long,
+                               device=device)
+
+
+def flip_planes_batch(states):
+    """Colour-flip a (B, 104, 8, 8) torch batch. Mirrors ``flip_planes``."""
+    import torch
+
+    if states.dim() != 4 or states.shape[1] != NUM_PLANES:
+        raise ValueError(
+            f"expected (B, {NUM_PLANES}, 8, 8) states, got {tuple(states.shape)}"
+        )
+    out = torch.empty_like(states)
+    for step in range(HISTORY_STEPS):
+        off = step * PIECE_PLANES_PER_STEP
+        # rank flip is dim -2; the colour swap is the plane-block swap
+        out[:, off:off + 6] = states[:, off + 6:off + 12].flip(-2)
+        out[:, off + 6:off + 12] = states[:, off:off + 6].flip(-2)
+
+    m = META_BASE
+    out[:, m + META_SIDE_TO_MOVE] = 1.0 - states[:, m + META_SIDE_TO_MOVE]
+    out[:, m + META_WK] = states[:, m + META_BK]
+    out[:, m + META_WQ] = states[:, m + META_BQ]
+    out[:, m + META_BK] = states[:, m + META_WK]
+    out[:, m + META_BQ] = states[:, m + META_WQ]
+    out[:, m + META_EP] = states[:, m + META_EP].flip(-2)
+    out[:, m + META_HALFMOVE] = states[:, m + META_HALFMOVE]
+    out[:, m + META_REPETITION] = states[:, m + META_REPETITION]
+    return out
+
+
+def flip_policy_batch(pis, mirror_index=None):
+    """Permute a (B, 4672) torch policy batch.
+
+    ``out[m[i]] = pi[i]`` with ``m`` an involution is exactly ``out = pi[m]``,
+    so this is a single gather rather than a scatter.
+    """
+    import torch
+
+    if mirror_index is None:
+        mirror_index = _mirror_index_tensor(pis.device, torch)
+    return pis.index_select(1, mirror_index)
+
+
+def augment_batch(states, pis, mask, mirror_index=None):
+    """Colour-flip the rows of a batch selected by boolean ``mask``.
+
+    Returns new tensors; the originals are untouched.  Flipping a random half
+    of each minibatch gives the network both orientations of the same
+    positions over training without storing either twice.
+    """
+    import torch
+
+    if not bool(mask.any()):
+        return states, pis
+    states = states.clone()
+    pis = pis.clone()
+    idx = mask.nonzero(as_tuple=True)[0]
+    states[idx] = flip_planes_batch(states[idx])
+    pis[idx] = flip_policy_batch(pis[idx], mirror_index)
+    return states, pis
