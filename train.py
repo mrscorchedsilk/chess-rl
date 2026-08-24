@@ -844,6 +844,33 @@ def _new_optimizer(cfg, net):
                 weight_decay=getattr(cfg, "weight_decay", 1e-4))
 
 
+def _train_loader(cfg, buffer, device):
+    """Cached PinnedReplayLoader for this (buffer, batch_size, device).
+
+    The loader owns a small pool of reusable pinned host buffers, so it must
+    OUTLIVE a single iteration — rebuilding it per call would re-allocate
+    page-locked memory every iteration.  It is cached on the buffer because
+    that is the object whose lifetime it must match; the cache is invalidated
+    if the batch size or device changes.
+    """
+    if int(getattr(cfg, "train_prefetch", 1)) <= 0:
+        return None
+    key = (int(cfg.train_batch_size), str(device))
+    cached = getattr(buffer, "_pinned_loader", None)
+    if cached is not None and getattr(buffer, "_pinned_loader_key", None) == key:
+        return cached
+    loader = PinnedReplayLoader(
+        buffer, cfg.train_batch_size, device,
+        num_prefetch=int(getattr(cfg, "train_prefetch", 1)),
+    )
+    try:
+        buffer._pinned_loader = loader
+        buffer._pinned_loader_key = key
+    except Exception:  # noqa: BLE001 - caching is an optimisation, not a contract
+        pass
+    return loader
+
+
 def _epoch_train(cfg, net, optimizer, buffer, device, scaler=None, *,
                  run_id=None, iteration=None, generation=None,
                  optimizer_steps_total=None, positions_generated=None):
@@ -883,6 +910,16 @@ def _epoch_train(cfg, net, optimizer, buffer, device, scaler=None, *,
                 "sample_reuse": 0.0, "sample_size": 0}
 
     net.train()
+    # NHWC for the conv body: the same memory format the inference runtime
+    # uses, and the one cuDNN's FP16 kernels prefer on this hardware.  A
+    # channels_last module has identical state_dict keys and values, so
+    # checkpoint round-trips are unaffected.
+    channels_last = (bool(getattr(cfg, "train_channels_last", False))
+                     and _device_type(device) == "cuda")
+    if channels_last:
+        net.to(memory_format=torch.channels_last)
+
+    loader = _train_loader(cfg, buffer, device)
     sum_policy = sum_value = sum_entropy = 0.0
     steps = batches = 0
     amp = scaler is not None and bool(getattr(scaler, "_enabled", False))
@@ -892,9 +929,22 @@ def _epoch_train(cfg, net, optimizer, buffer, device, scaler=None, *,
             # Sampling only permutation(sample_size) would repeatedly train the
             # oldest prefix and starve newly generated positions.
             rows = np.random.choice(n, size=sample_size, replace=False)
-            for start in range(0, sample_size, cfg.train_batch_size):
-                batch_rows = rows[start:start + cfg.train_batch_size]
-                states, pis, zs = buffer.sample_indices(batch_rows, device)
+            # Async pinned staging: the loader decompresses and H2D-copies the
+            # NEXT minibatch on a background thread while this one trains.
+            # replay.PinnedReplayLoader already existed and was wired to
+            # nothing; the loop used the synchronous sample_indices path.
+            # Falls back to that path on CPU or when train_prefetch is 0.
+            if loader is not None:
+                batch_iter = loader.batches(rows)
+            else:
+                batch_iter = (
+                    buffer.sample_indices(
+                        rows[start:start + cfg.train_batch_size], device)
+                    for start in range(0, sample_size, cfg.train_batch_size)
+                )
+            for states, pis, zs in batch_iter:
+                if channels_last:
+                    states = states.contiguous(memory_format=torch.channels_last)
                 if amp:
                     with torch.autocast(device_type=_device_type(device)):
                         logits, value = net(states)
@@ -1733,7 +1783,10 @@ def run_native(cfg=None, resume=False, on_iteration=None,
             sp = native_selfplay.NativeSelfPlay(
                 cfg,
                 inference_fn,
-                games=cfg.games_per_iteration,
+                # games=None -> cfg.selfplay_games_in_flight, falling back to
+                # games_per_iteration.  Concurrency is a throughput knob and is
+                # no longer forced to equal the training cadence.
+                games=None,
                 weight_version=optimizer_steps,  # monotonically increases
                 generation=generation,
                 seed=round_seed,
@@ -1743,7 +1796,9 @@ def run_native(cfg=None, resume=False, on_iteration=None,
             with telemetry.PhaseTimer("selfplay") as _sp_timer:
                 sp_examples = sp.run()
             buffer.extend(sp_examples)
-            games_played += cfg.games_per_iteration
+            # Count the games the actor actually played, which is
+            # games_in_flight and no longer necessarily games_per_iteration.
+            games_played += sp.games
             try:
                 _gstats = _gpu_stats(inference_fn)
                 telemetry.safe_emit(cfg, {
@@ -1753,7 +1808,13 @@ def run_native(cfg=None, resume=False, on_iteration=None,
                     "iteration": iteration,
                     "generation": generation,
                     "duration_s": _sp_timer.duration_s,
-                    "games": cfg.games_per_iteration,
+                    "games": sp.games,
+                    "games_per_iteration": int(cfg.games_per_iteration),
+                    "games_in_flight": sp.games,
+                    "leaves_per_game": int(
+                        getattr(cfg, "selfplay_leaves_per_game", 0) or 0),
+                    "max_batch": int(getattr(cfg, "selfplay_max_batch", 256)),
+                    "actor_threads": int(getattr(sp.actor, "num_threads", 0)),
                     "examples": len(sp_examples),
                     "inference_calls": sp.inference_calls,
                     **sp.batch_stats,

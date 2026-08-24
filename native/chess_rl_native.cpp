@@ -159,8 +159,10 @@ void mcts_apply_evaluations(
 // same tensor shapes as MCTS.gather_leaves but the leaves merged across every
 // in-play game into one batch. tokens = [0, 1, 2, ...] flat indices into the
 // merged pending list.
-py::tuple actor_gather_leaves(Actor& self, int max_batch) {
-    const Actor::GatherResult result = self.gather_leaves(max_batch);
+py::tuple actor_gather_leaves(Actor& self, int max_batch,
+                              int leaves_per_game) {
+    const Actor::GatherResult result =
+        self.gather_leaves(max_batch, leaves_per_game);
     const int B = static_cast<int>(result.leaves.size());
 
     std::vector<int> tokens(static_cast<std::size_t>(B));
@@ -320,7 +322,11 @@ PYBIND11_MODULE(_chess_rl_native, module) {
              py::arg("num_threads") = 0)
         .def("set_teacher", &Actor::set_teacher, py::arg("weight_version"),
              py::arg("generation"))
-        .def("gather_leaves", &actor_gather_leaves, py::arg("max_batch"))
+        .def("gather_leaves", &actor_gather_leaves, py::arg("max_batch"),
+             py::arg("leaves_per_game") = 0,
+             "Merged leaf batch across in-play games.  leaves_per_game > 0 "
+             "gives each game a FIXED leaf target so more games enlarge the "
+             "batch; 0 keeps the legacy equal-share split of max_batch.")
         .def("apply_evaluations", &actor_apply_evaluations, py::arg("tokens"),
              py::arg("legal_offsets"), py::arg("legal_logits"),
              py::arg("values"))

@@ -44,6 +44,7 @@ from __future__ import annotations
 
 import time
 import warnings
+import contextlib
 from collections import deque
 from dataclasses import dataclass, field
 from typing import Optional, Tuple
@@ -66,7 +67,13 @@ __all__ = [
 
 # Fixed batch buckets: a call with B leaves is padded to the smallest bucket
 # that fits.  B > max(BUCKETS) is rejected.
-BUCKETS = (32, 64, 128, 256)
+# Batch buckets.  The ceiling used to be 256, which capped every forward
+# pass regardless of how many games were in flight; the actor then split
+# that fixed 256 across games, so raising concurrency THINNED the batch
+# instead of growing it.  Buckets are allocated lazily (see
+# _ensure_bucket), so a run that never exceeds 256 pays nothing for the
+# large ones.
+BUCKETS = (32, 64, 128, 256, 512, 1024, 2048, 4096)
 # Chess has at most 218 legal moves; 256 per row gives headroom and bounds the
 # CSR index buffers at 256 * B.
 MAX_LEGAL_PER_ROW = 256
@@ -119,6 +126,7 @@ class InferenceRuntime:
         amp: bool = True,
         compile: bool = True,
         buckets: Tuple[int, ...] = BUCKETS,
+        deterministic_eval: bool = True,
     ):
         if not torch.cuda.is_available():
             raise RuntimeError("InferenceRuntime requires CUDA; none available")
@@ -162,10 +170,15 @@ class InferenceRuntime:
 
         # ---- deterministic convs for the runtime's lifetime (restored in
         #      close()) ---- #
+        # cuDNN determinism is scoped to THIS runtime's forward passes, not
+        # set process-wide.  torch.backends is global state: flipping it in
+        # __init__ and only restoring it in close() left the whole process —
+        # including the training loop, which wants autotuning — pinned to
+        # deterministic algorithms with benchmark search disabled for the
+        # entire life of the run.  See _cudnn_eval_scope.
         self._prev_cudnn_deterministic = torch.backends.cudnn.deterministic
         self._prev_cudnn_benchmark = torch.backends.cudnn.benchmark
-        torch.backends.cudnn.deterministic = True
-        torch.backends.cudnn.benchmark = False
+        self.deterministic_eval = bool(deterministic_eval)
 
         # ---- forward: torch.compile with a clean eager fallback ---- #
         self._compiled = None
@@ -204,44 +217,75 @@ class InferenceRuntime:
         # Under amp the network runs in FP16 anyway, so stage inputs as FP16
         # and halve the H2D bus bytes (autocast was casting on-device before).
         self.staging_dtype = torch.float16 if self.amp else torch.float32
-        for b in self.buckets:
-            cap = b * MAX_LEGAL_PER_ROW
-            in_shape = (b, self.num_planes, self.board_size, self.board_size)
-            self._pinned[b] = {
-                "in": torch.empty(
-                    in_shape, dtype=self.staging_dtype, pin_memory=True
-                ),
-                # Compact-plane staging: the native actor emits uint8 planes,
-                # which move 4x fewer bytes over PCIe and skip the CPU-side
-                # float cast entirely.  Expansion happens on the GPU.
-                "in_u8": torch.empty(in_shape, dtype=torch.uint8, pin_memory=True),
-                "off": torch.empty((b + 1,), dtype=torch.int32, pin_memory=True),
-                "idx": torch.empty((cap,), dtype=torch.int32, pin_memory=True),
-                "logits": torch.empty((cap,), dtype=torch.float32, pin_memory=True),
-                "val": torch.empty((b, 1), dtype=torch.float32, pin_memory=True),
-            }
-            self._dev[b] = {
-                "in": torch.empty(
-                    in_shape,
-                    dtype=self.staging_dtype,
-                    device=self.device,
-                    memory_format=torch.channels_last,
-                ),
-                "in_u8": torch.empty(
-                    in_shape, dtype=torch.uint8, device=self.device
-                ),
-                "off": torch.empty((b + 1,), dtype=torch.int32, device=self.device),
-                "idx": torch.empty((cap,), dtype=torch.int32, device=self.device),
-            }
-            self._events[b] = {
-                "h2d": torch.cuda.Event(),
-                "fwd": torch.cuda.Event(),
-                "d2h": torch.cuda.Event(),
-            }
+        # Buffers are allocated per bucket ON FIRST USE (see _ensure_bucket).
+        # Eagerly allocating every bucket up to 4096 would reserve ~180 MB of
+        # pinned host and ~170 MB of device memory for a run that may never
+        # need a batch larger than 256.
+        if getattr(self.cfg, "prealloc_buckets", False):
+            for b in self.buckets:
+                self._ensure_bucket(b)
+
+    def _ensure_bucket(self, b: int) -> None:
+        """Allocate the pinned/device buffers and events for one bucket."""
+        if b in self._pinned:
+            return
+        cap = b * MAX_LEGAL_PER_ROW
+        in_shape = (b, self.num_planes, self.board_size, self.board_size)
+        self._pinned[b] = {
+            "in": torch.empty(
+                in_shape, dtype=self.staging_dtype, pin_memory=True
+            ),
+            # Compact-plane staging: the native actor emits uint8 planes,
+            # which move 4x fewer bytes over PCIe and skip the CPU-side
+            # float cast entirely.  Expansion happens on the GPU.
+            "in_u8": torch.empty(in_shape, dtype=torch.uint8, pin_memory=True),
+            "off": torch.empty((b + 1,), dtype=torch.int32, pin_memory=True),
+            "idx": torch.empty((cap,), dtype=torch.int32, pin_memory=True),
+            "logits": torch.empty((cap,), dtype=torch.float32, pin_memory=True),
+            "val": torch.empty((b, 1), dtype=torch.float32, pin_memory=True),
+        }
+        self._dev[b] = {
+            "in": torch.empty(
+                in_shape,
+                dtype=self.staging_dtype,
+                device=self.device,
+                memory_format=torch.channels_last,
+            ),
+            "in_u8": torch.empty(
+                in_shape, dtype=torch.uint8, device=self.device
+            ),
+            "off": torch.empty((b + 1,), dtype=torch.int32, device=self.device),
+            "idx": torch.empty((cap,), dtype=torch.int32, device=self.device),
+        }
+        self._events[b] = {
+            "h2d": torch.cuda.Event(),
+            "fwd": torch.cuda.Event(),
+            "d2h": torch.cuda.Event(),
+        }
 
     # ------------------------------------------------------------------ #
     #  forward                                                            #
     # ------------------------------------------------------------------ #
+    @contextlib.contextmanager
+    def _cudnn_eval_scope(self):
+        """Deterministic cuDNN for the duration of one evaluation forward.
+
+        Restores whatever the process had before, so a training loop running
+        in the same process keeps ``cudnn.benchmark`` autotuning.
+        """
+        if not self.deterministic_eval:
+            yield
+            return
+        prev_d = torch.backends.cudnn.deterministic
+        prev_b = torch.backends.cudnn.benchmark
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+        try:
+            yield
+        finally:
+            torch.backends.cudnn.deterministic = prev_d
+            torch.backends.cudnn.benchmark = prev_b
+
     def _forward_impl(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """Body + policy head under FP16 autocast; value head in FP32.
 
@@ -368,6 +412,7 @@ class InferenceRuntime:
         """
         inputs, off, idx, B, K = self._validate(inputs, offsets, indices)
         bucket = next(b for b in self.buckets if b >= B)
+        self._ensure_bucket(bucket)
         pin, dev = self._pinned[bucket], self._dev[bucket]
 
         # ---- stage on pinned host (synchronous CPU copies) ---- #
@@ -426,7 +471,8 @@ class InferenceRuntime:
         ``(legal_logits[K] fp32, values[bucket,1] fp32)``.
         """
         cur = torch.cuda.current_stream()
-        logits, values = self._compiled(call.dev_in)  # [bucket,4672] [bucket,1]
+        with self._cudnn_eval_scope():
+            logits, values = self._compiled(call.dev_in)  # [bucket,4672] [bucket,1]
         K = call.K
         if K == 0:
             legal = torch.empty((0,), dtype=torch.float32, device=self.device)

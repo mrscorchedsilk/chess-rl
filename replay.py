@@ -321,6 +321,12 @@ class PinnedReplayLoader:
                     if not self._ready:
                         break
                     dev = self._ready.popleft()
+                    # Wake the producer: it parks on
+                    # `len(self._ready) >= num_prefetch`, so draining the queue
+                    # is exactly the condition it is waiting for.  Without this
+                    # notify the producer sleeps forever once the queue first
+                    # fills, and consumer and producer deadlock on batch 2.
+                    self._cond.notify_all()
                 self._batch_count += 1
                 yield dev
         finally:
@@ -376,19 +382,31 @@ class PinnedReplayLoader:
 
     def _stage(self, buf_idx, states, pis, zs):
         """Copy into the reusable pinned buffer set ``buf_idx``; wait for its
-        previous H2D copy (CUDA event) so it is safe to overwrite."""
+        previous H2D copy (CUDA event) so it is safe to overwrite.
+
+        Buffers are allocated at the FULL ``batch_size`` and short batches are
+        staged into a prefix view.  Sizing them from the first slice instead
+        would make the ragged final slice of an epoch — 8192 % 256, or any
+        sample_size that is not a whole multiple of the batch — fail with a
+        shape mismatch on copy_.
+        """
         if buf_idx >= len(self._pin_sets):
+            full = (self.batch_size,)
             self._pin_sets.append((
-                torch.empty_like(states, pin_memory=True),
-                torch.empty_like(pis, pin_memory=True),
-                torch.empty_like(zs, pin_memory=True),
+                torch.empty(full + states.shape[1:], dtype=states.dtype,
+                            pin_memory=True),
+                torch.empty(full + pis.shape[1:], dtype=pis.dtype,
+                            pin_memory=True),
+                torch.empty(full + zs.shape[1:], dtype=zs.dtype,
+                            pin_memory=True),
             ))
             self._pin_events.append(None)
         prev = self._pin_events[buf_idx]
         if prev is not None:
             prev.synchronize()   # previous copy from this buffer has finished
+        n = int(states.shape[0])
         states_p, pis_p, zs_p = self._pin_sets[buf_idx]
-        states_p.copy_(states, non_blocking=False)  # host -> pinned host
-        pis_p.copy_(pis, non_blocking=False)
-        zs_p.copy_(zs, non_blocking=False)
-        return states_p, pis_p, zs_p
+        states_p[:n].copy_(states, non_blocking=False)  # host -> pinned host
+        pis_p[:n].copy_(pis, non_blocking=False)
+        zs_p[:n].copy_(zs, non_blocking=False)
+        return states_p[:n], pis_p[:n], zs_p[:n]

@@ -203,7 +203,11 @@ class ChessNet(torch.nn.Module):
 
         # value head
         v = F.relu(self.value_conv(x))
-        v = v.view(v.size(0), -1)
+        # reshape, not view: under channels_last the conv output is NHWC-strided
+        # and `view` raises "view size is not compatible with input tensor's
+        # size and stride".  reshape falls back to a copy exactly when the
+        # tensor is non-contiguous and is a no-op otherwise.
+        v = v.reshape(v.size(0), -1)
         v = F.relu(self.value_fc1(v))
         value = torch.tanh(self.value_fc2(v))
 

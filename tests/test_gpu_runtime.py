@@ -138,12 +138,48 @@ def test_batch_bucketing_padding_is_masked(B):
 
 
 def test_batch_above_largest_bucket_raises():
+    """Expressed relative to the configured buckets so it cannot rot.
+
+    The ceiling was 256 and is now 4096; a hard-coded 300 used to be
+    over-budget and is now a normal batch.
+    """
     cfg, _, rt_model = _make_models()
     rt = InferenceRuntime(cfg=cfg, model=rt_model, compile=False)
     try:
-        inputs, offsets, indices = _make_batch(300, seed=0)
+        over = max(rt.buckets) + 1
+        inputs, offsets, indices = _make_batch(over, seed=0)
         with pytest.raises(ValueError, match="bucket"):
             rt.evaluate(inputs, offsets, indices)
+    finally:
+        rt.close()
+
+
+def test_batches_between_the_old_and_new_ceiling_are_accepted():
+    """The point of raising the ceiling: 300 and 1024 must now go through."""
+    cfg, _, rt_model = _make_models()
+    rt = InferenceRuntime(cfg=cfg, model=rt_model, compile=False)
+    try:
+        for b in (300, 1024):
+            if b > max(rt.buckets):
+                continue
+            inputs, offsets, indices = _make_batch(b, seed=b)
+            logits, values = rt.evaluate(inputs, offsets, indices)
+            assert values.shape == (b, 1)
+            assert logits.shape[0] == int(offsets[-1])
+    finally:
+        rt.close()
+
+
+def test_buckets_are_allocated_lazily():
+    """A run that never exceeds 256 must not reserve the 4096 buffers."""
+    cfg, _, rt_model = _make_models()
+    rt = InferenceRuntime(cfg=cfg, model=rt_model, compile=False)
+    try:
+        assert rt._pinned == {}, "no bucket should be allocated before first use"
+        inputs, offsets, indices = _make_batch(40, seed=1)
+        rt.evaluate(inputs, offsets, indices)
+        assert set(rt._pinned) == {64}
+        assert max(rt.buckets) not in rt._pinned
     finally:
         rt.close()
 

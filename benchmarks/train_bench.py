@@ -94,11 +94,17 @@ def main() -> None:
                     help="measured wall seconds per training iteration, for "
                          "the steps/hour projection")
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    ap.add_argument("--no-channels-last", action="store_true")
+    ap.add_argument("--no-prefetch", action="store_true")
     ap.add_argument("--json", default=None, help="write results as JSON here")
     args = ap.parse_args()
 
     cfg = build_cfg(args.arch, args.epoch_size, args.batch, args.epochs,
                     args.replay, args.device)
+    if args.no_channels_last:
+        cfg.train_channels_last = False
+    if args.no_prefetch:
+        cfg.train_prefetch = 0
     buf = fill(cfg, min(args.fill, args.replay))
     net = ChessNet(cfg).to(args.device)
     params = sum(p.numel() for p in net.parameters())
@@ -130,6 +136,8 @@ def main() -> None:
         "params": params,
         "device": args.device,
         "train_epoch_size": args.epoch_size,
+        "channels_last": bool(getattr(cfg, "train_channels_last", False)),
+        "prefetch": int(getattr(cfg, "train_prefetch", 0)),
         "train_batch_size": args.batch,
         "epochs": args.epochs,
         "replay_rows": len(buf),

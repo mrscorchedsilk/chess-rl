@@ -71,13 +71,21 @@ class Actor {
         std::vector<std::int32_t> legal_indices;
     };
 
-    // Runs up to `max_batch` MCTS simulations per in-play game (each game's
-    // MCTS bounds its own remaining simulation budget) and concatenates the
-    // leaves into one merged batch. tokens = [0, 1, 2, ...] flat indices into
-    // the merged pending list; per-leaf game ownership is tracked internally
-    // for apply_evaluations routing. Returns empty once every in-play game's
-    // search is complete.
-    [[nodiscard]] GatherResult gather_leaves(int max_batch);
+    // Gathers one merged leaf batch across every in-play game.
+    //
+    // `max_batch` is the TOTAL merged budget.  `leaves_per_game` is the
+    // per-game target: when > 0 each in-play game contributes up to that many
+    // leaves, so ADDING GAMES GROWS THE BATCH.  When 0 the legacy behaviour
+    // applies — the budget is split equally, max_batch / in_play, so adding
+    // games thinned each game's slice instead of enlarging the batch.  Either
+    // way the merged total never exceeds max_batch: the per-game target is
+    // clamped by the equal share.
+    //
+    // tokens = [0, 1, 2, ...] flat indices into the merged pending list;
+    // per-leaf game ownership is tracked internally for apply_evaluations
+    // routing.  Returns empty once every in-play game's search is complete.
+    [[nodiscard]] GatherResult gather_leaves(int max_batch,
+                                             int leaves_per_game = 0);
 
     // Routes each token's row of legal_logits/values back to the owning
     // game's MCTS.apply_evaluations. Array sizes are validated first;

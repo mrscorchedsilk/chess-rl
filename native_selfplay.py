@@ -107,7 +107,18 @@ class NativeSelfPlay:
     ):
         self.cfg = cfg
         self.inference_fn = inference_fn
-        self.games = int(games if games is not None else cfg.games_per_iteration)
+        # Games in flight = concurrency.  Explicit argument wins; otherwise
+        # cfg.selfplay_games_in_flight, falling back to the training-cadence
+        # knob cfg.games_per_iteration so existing configs are unchanged.
+        if games is not None:
+            self.games = int(games)
+        else:
+            in_flight = getattr(cfg, "selfplay_games_in_flight", None)
+            self.games = int(in_flight if in_flight else cfg.games_per_iteration)
+        # Actor worker threads: explicit config, else let the actor clamp to
+        # min(hardware_concurrency, games) itself.
+        actor_threads = getattr(cfg, "selfplay_actor_threads", None)
+        actor_threads = int(actor_threads) if actor_threads else self.games
         self.weight_version = int(weight_version)
         self.generation = int(generation)
         self.run_id = run_id
@@ -127,7 +138,7 @@ class NativeSelfPlay:
             temperature_threshold=int(cfg.temperature_threshold),
             max_game_length=int(cfg.max_game_length),
             seed=actor_seed,
-            num_threads=self.games,
+            num_threads=int(actor_threads),
         )
         self.actor.set_teacher(self.weight_version, self.generation)
 
@@ -148,13 +159,28 @@ class NativeSelfPlay:
         self.trajectory_hashes: List[str] = []  # one BLAKE2 digest per game
         self.batch_stats = telemetry._percentiles(self.batch_b)
 
-    def run(self, max_batch: int = 256) -> List[Tuple[np.ndarray, np.ndarray, float]]:
-        """Drive gather/apply/advance to completion; return replay examples."""
+    def run(self, max_batch: Optional[int] = None,
+            leaves_per_game: Optional[int] = None
+            ) -> List[Tuple[np.ndarray, np.ndarray, float]]:
+        """Drive gather/apply/advance to completion; return replay examples.
+
+        ``max_batch``/``leaves_per_game`` default to ``cfg.selfplay_max_batch``
+        and ``cfg.selfplay_leaves_per_game``.  With a fixed per-game leaf
+        target the merged batch grows with the number of games in flight
+        instead of being sliced out of a fixed budget.
+        """
+        if max_batch is None:
+            max_batch = int(getattr(self.cfg, "selfplay_max_batch", 256))
+        if leaves_per_game is None:
+            leaves_per_game = int(
+                getattr(self.cfg, "selfplay_leaves_per_game", 0) or 0
+            )
         examples: List[Tuple[np.ndarray, np.ndarray, float]] = []
         t_round = time.perf_counter()
         while not self.actor.is_done():
             t0 = time.perf_counter()
-            tokens, inputs, offsets, indices = self.actor.gather_leaves(max_batch)
+            tokens, inputs, offsets, indices = self.actor.gather_leaves(
+                max_batch, leaves_per_game)
             self.gather_s += time.perf_counter() - t0
             self.gather_calls += 1
             if len(tokens) == 0:

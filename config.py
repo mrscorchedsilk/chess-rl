@@ -86,6 +86,14 @@ class Config:
     replay_buffer_size = 50_000
     num_iterations = 200
     amp = True                   # mixed precision (autocast + GradScaler) on CUDA
+    # ---- training-path GPU ergonomics ----
+    # The inference runtime got channels_last, torch.compile and pinned async
+    # staging; the training loop got none of them and used the synchronous
+    # ReplayBuffer.sample_indices while replay.PinnedReplayLoader sat unused.
+    train_channels_last = True   # NHWC weights+activations for the conv body
+    train_prefetch = 1           # PinnedReplayLoader lookahead (0 -> synchronous)
+    train_compile = False        # opt-in: torch.compile the training step
+
 
     # ---- arena acceptance gating (new net vs current best) ----
     arena_every = 10
@@ -127,6 +135,27 @@ class Config:
     result_timeout_seconds = 60 # upper bound for a worker's game to land in the queue
     inference_max_batch = 4096  # server coalescing cap (positions per forward)
     inference_min_batch = 256   # below this the server waits a beat for more workers
+
+    # ---- native self-play concurrency (decoupled from training cadence) ----
+    # `games_per_iteration` is a TRAINING-cadence knob: how many completed
+    # games feed one training iteration.  `selfplay_games_in_flight` is a
+    # THROUGHPUT knob: how many games the native actor searches concurrently,
+    # which is what sets the GPU batch size.  They used to be the same number,
+    # and because gather_leaves split a fixed 256-position budget equally
+    # across in-play games, raising concurrency made each game's slice THINNER
+    # rather than making the batch bigger.
+    #
+    # None -> follow games_per_iteration (previous behaviour).
+    selfplay_games_in_flight = None
+    # Fixed leaf target per in-play game per gather round.  With this set, the
+    # merged batch is games_in_flight * leaves_per_game (capped by
+    # selfplay_max_batch), so concurrency and batch size scale together.
+    selfplay_leaves_per_game = 12
+    # Total merged batch budget handed to gather_leaves.  Must be <= the
+    # largest InferenceRuntime bucket.
+    selfplay_max_batch = 4096
+    # Actor worker threads; None -> min(hardware_concurrency, games).
+    selfplay_actor_threads = None
 
     device = get_device()
 

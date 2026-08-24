@@ -112,7 +112,8 @@ def build_actor(cfg, games, threads, seed):
     )
 
 
-def run(cfg, evaluate, games, threads, max_batch, max_rounds, full_games, seed):
+def run(cfg, evaluate, games, threads, max_batch, max_rounds, full_games, seed,
+        leaves_per_game=0):
     actor = build_actor(cfg, games, threads, seed)
     actor.set_teacher(0, 0)
     t_gather = t_infer = t_apply = t_adv = 0.0
@@ -123,7 +124,8 @@ def run(cfg, evaluate, games, threads, max_batch, max_rounds, full_games, seed):
         if not full_games and rounds >= max_rounds:
             break
         a = time.perf_counter()
-        tokens, inputs, offsets, indices = actor.gather_leaves(max_batch)
+        tokens, inputs, offsets, indices = actor.gather_leaves(
+            max_batch, leaves_per_game)
         b = time.perf_counter()
         t_gather += b - a
         if len(tokens) == 0:
@@ -175,6 +177,12 @@ def main() -> None:
     ap.add_argument("--threads", type=int, default=0, help="0 -> actor default")
     ap.add_argument("--sims", type=int, default=None)
     ap.add_argument("--max-batch", type=int, default=256)
+    ap.add_argument("--leaves-per-game", type=int, default=0,
+                    help="fixed leaf target per in-play game (0 = legacy "
+                         "equal-share split of --max-batch). NOTE: the legacy "
+                         "split with a large --max-batch lets a single game "
+                         "gather its WHOLE search in one round, which changes "
+                         "search behaviour, not just batching.")
     ap.add_argument("--rounds", type=int, default=300)
     ap.add_argument("--full-games", action="store_true",
                     help="run to completion and report real games/hour")
@@ -205,7 +213,7 @@ def main() -> None:
         evaluate = rt.evaluate
         # warm the compiled graphs / bucket buffers before timing
         run(cfg, evaluate, min(args.games, 4), args.threads or 0,
-            args.max_batch, 20, False, args.seed + 1)
+            args.max_batch, 20, False, args.seed + 1, args.leaves_per_game)
         sampler = GpuSampler()
     else:
         evaluate = fake_evaluator
@@ -213,16 +221,19 @@ def main() -> None:
     if sampler is not None:
         with sampler:
             res = run(cfg, evaluate, args.games, args.threads,
-                      args.max_batch, args.rounds, args.full_games, args.seed)
+                      args.max_batch, args.rounds, args.full_games, args.seed,
+                      args.leaves_per_game)
         res.update(sampler.summary())
     else:
         res = run(cfg, evaluate, args.games, args.threads,
-                  args.max_batch, args.rounds, args.full_games, args.seed)
+                  args.max_batch, args.rounds, args.full_games, args.seed,
+                  args.leaves_per_game)
 
     res["mode"] = "gpu" if args.gpu else "fake"
     res["arch"] = args.arch
     res["sims"] = cfg.num_simulations
     res["max_batch"] = args.max_batch
+    res["leaves_per_game"] = args.leaves_per_game
     res["native_module"] = native.__file__
     res["label"] = args.label or res["mode"]
 

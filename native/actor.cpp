@@ -85,21 +85,24 @@ void Actor::set_teacher(int weight_version, int generation) {
     teacher_generation_ = generation;
 }
 
-Actor::GatherResult Actor::gather_leaves(int max_batch) {
+Actor::GatherResult Actor::gather_leaves(int max_batch, int leaves_per_game) {
     if (max_batch <= 0)
         throw std::invalid_argument("max_batch must be positive");
+    if (leaves_per_game < 0)
+        throw std::invalid_argument("leaves_per_game must be >= 0");
 
     GatherResult result;
     result.legal_offsets.push_back(0);
     leaf_game_.clear();
     game_base_.assign(games_.size() + 1, 0);
 
-    // `max_batch` is the TOTAL merged batch budget (the GPU runtime's fixed
-    // buckets cap it at 256).  Each in-play game gets an equal share so the
-    // merged total can never exceed max_batch.  Each game's MCTS is gathered
-    // EXACTLY ONCE per round (its pending list is consumed by the matching
-    // apply_evaluations), and its leaves stay contiguous so the game_base_
-    // routing in apply_evaluations holds.
+    // `max_batch` is the TOTAL merged batch budget.  With leaves_per_game > 0
+    // each in-play game contributes a FIXED number of leaves, so more games
+    // means a bigger batch; the equal share (max_batch / in_play) is retained
+    // only as the cap that keeps the merged total within budget.  Each game's
+    // MCTS is gathered EXACTLY ONCE per round (its pending list is consumed by
+    // the matching apply_evaluations), and its leaves stay contiguous so the
+    // game_base_ routing in apply_evaluations holds.
     int in_play = 0;
     for (const GameState& game : games_)
         if (!game.finished && !game.mcts.is_complete()) ++in_play;
@@ -107,7 +110,9 @@ Actor::GatherResult Actor::gather_leaves(int max_batch) {
         game_base_.assign(games_.size() + 1, 0);
         return result;
     }
-    const int per_game = std::max(1, max_batch / in_play);
+    const int share = std::max(1, max_batch / in_play);
+    const int per_game =
+        leaves_per_game > 0 ? std::min(leaves_per_game, share) : share;
 
     // Gather each in-play game's leaves in parallel (games are fully
     // independent: each owns its MCTS, board and RNG), then merge serially in
