@@ -36,6 +36,25 @@ struct Game {
     int teacher_weight_version = -1;
     std::string result_termination;
     int game_index = -1;  // deterministic ordering key for parallel finalise
+
+    // ---- resignation calibration ----
+    // `resigned` / `adjudicated_draw`: the game was cut short.
+    // `playout`: this game had early termination DISABLED so its true result
+    //   could be observed (the calibration sample).
+    // `would_have_resigned` / `would_have_drawn`: a playout game that hit the
+    //   condition but kept going.
+    // `false_resignation` / `false_draw`: the observed result contradicts what
+    //   the cut short would have claimed.  Only ever set on playout games —
+    //   a resigned game has no ground truth to check against, which is the
+    //   whole reason a fraction of games must be played out.
+    bool resigned = false;
+    bool adjudicated_draw = false;
+    bool playout = false;
+    bool would_have_resigned = false;
+    bool would_have_drawn = false;
+    bool false_resignation = false;
+    bool false_draw = false;
+    int plies = 0;
 };
 
 // Native multi-game self-play actor (AlphaZero style, mirroring selfplay.py):
@@ -54,7 +73,23 @@ class Actor {
   public:
     Actor(int games, double c_puct, double virtual_loss, int num_simulations,
           double temperature, int temperature_threshold, int max_game_length,
-          std::uint64_t seed, int num_threads = 0);
+          std::uint64_t seed, int num_threads = 0,
+          // Resignation: when the root value stays below `resign_threshold`
+          // for `resign_consecutive` consecutive completed searches, the side
+          // to move resigns.  `resign_playout_fraction` of games have this
+          // disabled and are played to a real finish so the false-positive
+          // rate is observable; without that sample the threshold is a guess
+          // that silently poisons the value target.  Negative threshold
+          // disables resignation entirely.
+          double resign_threshold = -1.0,
+          int resign_consecutive = 2,
+          double resign_playout_fraction = 0.10,
+          // Draw adjudication: |root value| below `draw_threshold` for
+          // `draw_consecutive` searches, after at least `draw_min_ply` plies.
+          // Negative threshold disables it.
+          double draw_threshold = -1.0,
+          int draw_consecutive = 8,
+          int draw_min_ply = 60);
 
     // Records the immutable (weight_version, generation) teacher handle that
     // produced every completed game. No weights are loaded here; the network
@@ -122,6 +157,21 @@ class Actor {
         bool finished = false;
         std::mt19937 rng;  // move sampling, seeded deterministically
 
+        // ---- early-termination bookkeeping ----
+        // Resignation streaks are PER SIDE.  Completed searches alternate
+        // sides, so a single shared counter resets every other ply and a
+        // "N consecutive losing evaluations" rule could never fire unless
+        // both players were simultaneously lost.
+        int resign_streak_w = 0;
+        int resign_streak_b = 0;
+        int draw_streak = 0;
+        bool playout = false;             // early termination disabled here
+        bool would_have_resigned = false;
+        bool would_have_drawn = false;
+        std::string would_resign_side;    // "w"/"b" of the side that would have
+        bool resigned = false;
+        bool adjudicated_draw = false;
+
         GameState(double c_puct, double virtual_loss, int num_simulations,
                   double dirichlet_alpha, double dirichlet_epsilon,
                   std::uint64_t seed);
@@ -152,6 +202,12 @@ class Actor {
     double temperature_;
     int temperature_threshold_;
     int max_game_length_;
+    double resign_threshold_;
+    int resign_consecutive_;
+    double resign_playout_fraction_;
+    double draw_threshold_;
+    int draw_consecutive_;
+    int draw_min_ply_;
     int teacher_generation_ = -1;
     int teacher_weight_version_ = -1;
 

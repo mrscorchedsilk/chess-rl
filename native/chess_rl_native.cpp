@@ -228,6 +228,17 @@ py::list actor_finished_games(Actor& self) {
         record["generation"] = game.teacher_generation;
         record["weight_version"] = game.teacher_weight_version;
         record["termination"] = game.result_termination;
+        // Early-termination calibration.  `playout` marks the games in which
+        // resignation/adjudication were DISABLED so a real result could be
+        // observed; false_resignation / false_draw are only ever set on those.
+        record["resigned"] = game.resigned;
+        record["adjudicated_draw"] = game.adjudicated_draw;
+        record["playout"] = game.playout;
+        record["would_have_resigned"] = game.would_have_resigned;
+        record["would_have_drawn"] = game.would_have_drawn;
+        record["false_resignation"] = game.false_resignation;
+        record["false_draw"] = game.false_draw;
+        record["plies"] = game.plies;
         py::list examples;
         for (const Example& ex : game.examples) {
             py::array_t<float> state({104, 8, 8});
@@ -320,20 +331,30 @@ PYBIND11_MODULE(_chess_rl_native, module) {
              py::arg("values"))
         .def("is_complete", &MCTS::is_complete)
         .def("policy", &MCTS::policy, py::arg("temperature") = 0.0)
-        .def("root_visit_counts", &MCTS::root_visit_counts);
+        .def("root_visit_counts", &MCTS::root_visit_counts)
+        .def("root_value", &MCTS::root_value,
+             "Root value from the root side-to-move's perspective "
+             "(W/N over root visits); 0.0 for an unvisited root.");
 
     // Actor (Task 6): native multi-game self-play. Each game owns its own
     // MCTS core and Position; gather_leaves merges leaves across games and
     // apply_evaluations routes the network output back per game.
     py::class_<Actor>(module, "Actor")
         .def(py::init<int, double, double, int, double, int, int,
-                      std::uint64_t, int>(),
+                      std::uint64_t, int, double, int, double, double, int,
+                      int>(),
              py::arg("games"), py::arg("c_puct") = 1.25,
              py::arg("virtual_loss") = 3.0,
              py::arg("num_simulations") = 100, py::arg("temperature") = 1.0,
              py::arg("temperature_threshold") = 30,
              py::arg("max_game_length") = 400, py::arg("seed") = 42,
-             py::arg("num_threads") = 0)
+             py::arg("num_threads") = 0,
+             py::arg("resign_threshold") = -1.0,
+             py::arg("resign_consecutive") = 2,
+             py::arg("resign_playout_fraction") = 0.10,
+             py::arg("draw_threshold") = -1.0,
+             py::arg("draw_consecutive") = 8,
+             py::arg("draw_min_ply") = 60)
         .def("set_teacher", &Actor::set_teacher, py::arg("weight_version"),
              py::arg("generation"))
         .def("gather_leaves", &actor_gather_leaves, py::arg("max_batch"),

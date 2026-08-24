@@ -89,6 +89,71 @@ def derive_selfplay_seed(base_seed: int, iteration: int) -> int:
     return (x ^ (x >> 31)) & _MASK64
 
 
+def _actor_termination_kwargs(cfg):
+    """Resignation / adjudication arguments for the native Actor.
+
+    Disabled features are passed as sentinels (-1.0 thresholds) rather than
+    omitted, so the C++ side has a single code path and the validation there
+    (notably: resignation without a playout fraction is refused) always runs.
+    """
+    resign_on = bool(getattr(cfg, "resign_enabled", False))
+    draw_on = bool(getattr(cfg, "draw_adjudication_enabled", False))
+    return {
+        "resign_threshold": (float(getattr(cfg, "resign_threshold", -0.90))
+                             if resign_on else -1.0001),
+        "resign_consecutive": int(getattr(cfg, "resign_consecutive_plies", 2)),
+        "resign_playout_fraction": float(
+            getattr(cfg, "resign_playout_fraction", 0.10)),
+        "draw_threshold": (float(getattr(cfg, "draw_threshold", 0.02))
+                           if draw_on else -1.0),
+        "draw_consecutive": int(getattr(cfg, "draw_consecutive_plies", 8)),
+        "draw_min_ply": int(getattr(cfg, "draw_min_ply", 60)),
+    }
+
+
+def summarise_terminations(games):
+    """Aggregate resignation calibration over a round's finished games.
+
+    `false_resignation_rate` is measured ONLY over playout games that hit the
+    condition — the games where resignation was suppressed so a real result
+    existed to check against.  A resigned game has no ground truth, which is
+    precisely why a fraction must be played out.
+    """
+    total = len(games)
+    if total == 0:
+        return {}
+    playout = [g for g in games if g.get("playout")]
+    would_resign = [g for g in playout if g.get("would_have_resigned")]
+    would_draw = [g for g in playout if g.get("would_have_drawn")]
+    false_resign = [g for g in would_resign if g.get("false_resignation")]
+    false_draw = [g for g in would_draw if g.get("false_draw")]
+    plies = [int(g.get("plies", 0)) for g in games]
+    terms = {}
+    for g in games:
+        t = g.get("termination", "unknown")
+        terms[t] = terms.get(t, 0) + 1
+    return {
+        "games": total,
+        "resigned": sum(1 for g in games if g.get("resigned")),
+        "adjudicated_draws": sum(1 for g in games if g.get("adjudicated_draw")),
+        "playout_games": len(playout),
+        "playout_fraction": len(playout) / total,
+        "playout_would_resign": len(would_resign),
+        "false_resignations": len(false_resign),
+        # None (not 0.0) when no playout game hit the condition: "no evidence"
+        # and "no false positives" are different states and must not be
+        # confused by whoever reads the telemetry.
+        "false_resignation_rate": (len(false_resign) / len(would_resign)
+                                   if would_resign else None),
+        "playout_would_draw": len(would_draw),
+        "false_draws": len(false_draw),
+        "false_draw_rate": (len(false_draw) / len(would_draw)
+                            if would_draw else None),
+        "mean_plies": sum(plies) / total if plies else 0.0,
+        "terminations": terms,
+    }
+
+
 def _with_moves_left(game_examples, enabled):
     """Optionally attach the plies-remaining auxiliary target to one game.
 
@@ -158,6 +223,7 @@ class NativeSelfPlay:
         # consumes them is configured; otherwise the example contract stays
         # the original (state, pi, z) triple.
         self.emit_moves_left = bool(getattr(cfg, "moves_left_head", False))
+        self.termination_stats: dict = {}
         self.actor = native.Actor(
             games=self.games,
             c_puct=float(cfg.c_puct),
@@ -168,6 +234,7 @@ class NativeSelfPlay:
             max_game_length=int(cfg.max_game_length),
             seed=actor_seed,
             num_threads=int(actor_threads),
+            **_actor_termination_kwargs(cfg),
         )
         self.actor.set_teacher(self.weight_version, self.generation)
 
@@ -232,7 +299,9 @@ class NativeSelfPlay:
             self.simulations += int(self.cfg.num_simulations)
         self.round_duration_s = time.perf_counter() - t_round
         self.batch_stats = telemetry._percentiles(self.batch_b)
-        for game in self.actor.finished_games():
+        finished = self.actor.finished_games()
+        self.termination_stats = summarise_terminations(finished)
+        for game in finished:
             examples.extend(
                 _with_moves_left(game["examples"], self.emit_moves_left))
             # Generation-time trajectory identity: one BLAKE2 digest over the
@@ -408,6 +477,7 @@ class ShardedSelfPlay:
 
         self.round_seed = int(seed) if seed is not None else int(cfg.seed)
         self.emit_moves_left = bool(getattr(cfg, "moves_left_head", False))
+        self.termination_stats: dict = {}
         self.max_batch = int(getattr(cfg, "selfplay_max_batch", 256))
         self.leaves_per_game = int(
             getattr(cfg, "selfplay_leaves_per_game", 0) or 0)
@@ -440,6 +510,7 @@ class ShardedSelfPlay:
                 max_game_length=int(cfg.max_game_length),
                 seed=shard_seed,
                 num_threads=min(per_shard_threads, g),
+                **_actor_termination_kwargs(cfg),
             )
             actor.set_teacher(self.weight_version, self.generation)
             self.actors.append(actor)
@@ -568,13 +639,16 @@ class ShardedSelfPlay:
         # Shard order, then the actor's own game order: deterministic despite
         # the threads finishing in whatever order they finish.
         examples: List[Tuple[np.ndarray, np.ndarray, float]] = []
+        all_finished = []
         for actor in self.actors:
             for game in actor.finished_games():
+                all_finished.append(game)
                 examples.extend(
-                _with_moves_left(game["examples"], self.emit_moves_left))
+                    _with_moves_left(game["examples"], self.emit_moves_left))
                 self.trajectory_hashes.append(
                     telemetry.game_trajectory_hash(game["examples"])
                 )
+        self.termination_stats = summarise_terminations(all_finished)
         self._emit_round_telemetry(len(examples))
         return examples
 
@@ -615,6 +689,9 @@ class ShardedSelfPlay:
                 "simulations": self.simulations,
                 "leaves_per_game": self.leaves_per_game,
                 "max_batch": self.max_batch,
+                **{f"term_{k}": v
+                   for k, v in self.termination_stats.items()
+                   if k != "terminations"},
                 **self.batch_stats,
             })
         except Exception:  # noqa: BLE001 - telemetry must never kill training

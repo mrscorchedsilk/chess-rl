@@ -89,6 +89,12 @@ class MCTS {
     // UCI. Not part of the pinned contract; used by the native tests.
     [[nodiscard]] std::vector<std::pair<std::string, int>> root_visit_counts() const;
 
+    // Root value estimate from the ROOT SIDE-TO-MOVE's perspective, in
+    // [-1, 1]: W/N over the root's accumulated visits.  This is the search's
+    // own opinion of the current position and is what resignation reads.
+    // Returns 0.0 for an unvisited root (no evidence either way).
+    [[nodiscard]] float root_value() const;
+
   private:
     // Id of the child of `node` maximising
     //   -W/N + c_puct * P * sqrt(N_parent) / (1 + N)

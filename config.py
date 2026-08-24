@@ -188,6 +188,34 @@ class Config:
 
     # ---- misc ----
     max_game_length = 400       # plies hard cap -> draw
+
+    # ---- resignation and draw adjudication ----
+    # Most self-play compute goes into positions that are already decided; a
+    # weak network shuffles to the 400-ply cap.  Resignation reclaims that,
+    # and also improves data quality (dead positions carry no signal).
+    #
+    # It is OFF by default and must be opted into, because a threshold that is
+    # too aggressive poisons the value target invisibly: games get labelled
+    # with a result that never actually happened.  The guard against that is
+    # the playout fraction — `resign_playout_fraction` of games have
+    # resignation DISABLED and are played to a real finish, so the
+    # false-positive rate is measured every iteration rather than assumed.
+    # The native Actor refuses resignation with a zero playout fraction.
+    resign_enabled = False
+    resign_threshold = -0.90      # root value (mover's view) below this
+    resign_consecutive_plies = 2  # for this many of the MOVER's own searches
+    resign_playout_fraction = 0.10
+    # Watch `false_resignation_rate` in the selfplay telemetry; if it climbs,
+    # lower the threshold (more negative) before trusting the data.
+    resign_false_positive_budget = 0.05
+
+    # Draw adjudication: |root value| below the threshold for this many
+    # consecutive searches, after at least draw_min_ply plies.  Also off by
+    # default and monitored through the same playout games.
+    draw_adjudication_enabled = False
+    draw_threshold = 0.02
+    draw_consecutive_plies = 8
+    draw_min_ply = 60
     checkpoint_every_iterations = 20    # completed iterations between snapshots
     checkpoint_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                   "checkpoints", "v2")   # versioned; legacy checkpoints/ untouched

@@ -367,6 +367,13 @@ std::vector<std::pair<std::string, double>> MCTS::policy(double temperature) con
     return out;
 }
 
+float MCTS::root_value() const {
+    if (root_ < 0) return 0.0f;
+    const std::int32_t n = pool_.n(root_);
+    if (n <= 0) return 0.0f;
+    return pool_.w(root_) / static_cast<float>(n);
+}
+
 std::vector<std::pair<std::string, int>> MCTS::root_visit_counts() const {
     std::vector<std::pair<std::string, int>> out;
     if (!pool_.has_children(root_)) return out;

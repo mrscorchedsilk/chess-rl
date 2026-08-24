@@ -1,6 +1,7 @@
 #include "actor.h"
 
 #include <algorithm>
+#include <cmath>
 #include <stdexcept>
 
 namespace chess_rl_native {
@@ -33,10 +34,19 @@ Actor::GameState::GameState(double c_puct, double virtual_loss,
 Actor::Actor(int games, double c_puct, double virtual_loss,
              int num_simulations, double temperature,
              int temperature_threshold, int max_game_length,
-             std::uint64_t seed, int num_threads)
+             std::uint64_t seed, int num_threads,
+             double resign_threshold, int resign_consecutive,
+             double resign_playout_fraction, double draw_threshold,
+             int draw_consecutive, int draw_min_ply)
     : temperature_(temperature),
       temperature_threshold_(temperature_threshold),
       max_game_length_(max_game_length),
+      resign_threshold_(resign_threshold),
+      resign_consecutive_(resign_consecutive),
+      resign_playout_fraction_(resign_playout_fraction),
+      draw_threshold_(draw_threshold),
+      draw_consecutive_(draw_consecutive),
+      draw_min_ply_(draw_min_ply),
       num_threads_(ThreadPool::clamp_threads(
           std::min(num_threads > 0 ? num_threads : games, games))) {
     if (games <= 0) throw std::invalid_argument("games must be positive");
@@ -51,6 +61,24 @@ Actor::Actor(int games, double c_puct, double virtual_loss,
         throw std::invalid_argument("temperature_threshold must be >= 0");
     if (max_game_length <= 0)
         throw std::invalid_argument("max_game_length must be positive");
+    if (resign_threshold > 0.0)
+        throw std::invalid_argument(
+            "resign_threshold must be <= 0 (a losing root value); negative "
+            "values below -1 disable resignation");
+    if (resign_consecutive < 1)
+        throw std::invalid_argument("resign_consecutive must be >= 1");
+    if (resign_playout_fraction < 0.0 || resign_playout_fraction > 1.0)
+        throw std::invalid_argument(
+            "resign_playout_fraction must be in [0, 1]");
+    if (resign_threshold >= -1.0 && resign_playout_fraction <= 0.0)
+        throw std::invalid_argument(
+            "resignation without a playout fraction cannot be calibrated: the "
+            "false-positive rate would be unobservable. Use "
+            "resign_playout_fraction > 0 (0.10 is the usual choice).");
+    if (draw_consecutive < 1)
+        throw std::invalid_argument("draw_consecutive must be >= 1");
+    if (draw_min_ply < 0)
+        throw std::invalid_argument("draw_min_ply must be >= 0");
 
     games_.reserve(static_cast<std::size_t>(games));
     for (int g = 0; g < games; ++g) {
@@ -63,6 +91,12 @@ Actor::Actor(int games, double c_puct, double virtual_loss,
         GameState& game = games_.back();
         game.pos = Position::from_uci_history(START_FEN, {});
         game.mcts.set_root(START_FEN, {});
+        // Deterministic playout selection from the game seed — NOT from
+        // game.rng, which drives move sampling: drawing from it here would
+        // change every sampled move and silently break seed reproducibility.
+        const std::uint64_t r = derive_seed(game_seed, 0x9e3779b9ULL);
+        const double u = static_cast<double>(r % 1000000ULL) / 1000000.0;
+        game.playout = (u < resign_playout_fraction_);
     }
 
     // One persistent pool for the actor's whole lifetime.  Created after the
@@ -264,6 +298,23 @@ void Actor::finalise(int game_index, GameState& game, float white_result,
     done.teacher_weight_version = teacher_weight_version_;
     done.result_termination = std::move(termination);
     done.game_index = game_index;
+    done.resigned = game.resigned;
+    done.adjudicated_draw = game.adjudicated_draw;
+    done.playout = game.playout;
+    done.would_have_resigned = game.would_have_resigned;
+    done.would_have_drawn = game.would_have_drawn;
+    done.plies = static_cast<int>(game.examples.size());
+    // A resignation claims "the side to move loses".  On a playout game the
+    // real result is known, so the claim can be checked; it is FALSE whenever
+    // that side did not actually lose.
+    if (game.would_have_resigned) {
+        const bool actually_lost =
+            (game.would_resign_side == "w") ? (white_result < 0.0f)
+                                            : (white_result > 0.0f);
+        done.false_resignation = !actually_lost;
+    }
+    if (game.would_have_drawn)
+        done.false_draw = (white_result != 0.0f);
     done.examples.reserve(game.examples.size());
     for (Example& ex : game.examples) {
         // z-value convention (selfplay.py): from the side-to-move's view.
@@ -299,6 +350,54 @@ void Actor::advance() {
                 : (outcome->winner == "w" ? 1.0f : -1.0f);
             finalise(g, game, white_result, outcome->termination);
             return;
+        }
+
+        // ---- early termination (resignation / draw adjudication) ----
+        // Checked after the search completes and BEFORE an example is
+        // recorded: the game ends at this position, so it never produced a
+        // move and needs no policy target.
+        const float root_value = game.mcts.root_value();
+        const std::string side = game.pos->side_to_move();
+
+        const bool resign_on = (resign_threshold_ >= -1.0);
+        const bool white_to_move = (side == "w");
+        int& streak = white_to_move ? game.resign_streak_w
+                                    : game.resign_streak_b;
+        if (resign_on && root_value < resign_threshold_)
+            ++streak;
+        else
+            streak = 0;
+
+        const bool draw_on = (draw_threshold_ >= 0.0);
+        if (draw_on && ply >= draw_min_ply_ &&
+            std::fabs(root_value) < draw_threshold_)
+            ++game.draw_streak;
+        else
+            game.draw_streak = 0;
+
+        if (resign_on && streak >= resign_consecutive_) {
+            if (game.playout) {
+                // Calibration game: record that it WOULD have resigned and
+                // keep playing, so the true result can contradict it.
+                if (!game.would_have_resigned) {
+                    game.would_have_resigned = true;
+                    game.would_resign_side = side;
+                }
+            } else {
+                game.resigned = true;
+                finalise(g, game, side == "w" ? -1.0f : 1.0f, "resignation");
+                return;
+            }
+        }
+
+        if (draw_on && game.draw_streak >= draw_consecutive_) {
+            if (game.playout) {
+                game.would_have_drawn = true;
+            } else {
+                game.adjudicated_draw = true;
+                finalise(g, game, 0.0f, "adjudicated_draw");
+                return;
+            }
         }
 
         // Record the training example BEFORE the move is played.
