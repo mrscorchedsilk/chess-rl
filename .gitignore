@@ -16,3 +16,8 @@ evidence/
 
 # Hermes agent workspace (plans, session artifacts)
 .hermes/
+
+# worktree-local dev build staging (see devbuild.sh) — never installed into the
+# shared venv so the live v2 lineage keeps its own pinned native module
+/_pkg/
+/devenv.sh
