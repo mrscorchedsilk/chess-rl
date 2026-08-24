@@ -42,7 +42,10 @@ class MCTS {
         int node_id;                       // pool id of the leaf node
         std::vector<int> path;             // node ids root -> leaf, inclusive
         std::vector<std::int32_t> legal;   // legal move indices at the leaf
-        std::vector<float> planes;         // 104 * 64 encoded planes
+        // Compact 104 * 64 encoded planes (see Position::encode_planes_u8).
+        // Binary planes hold 0/1; the halfmove plane holds the raw clock and
+        // is divided by Position::HALFMOVE_SCALE by the consumer.
+        std::vector<std::uint8_t> planes;
     };
 
     struct GatherResult {

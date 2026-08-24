@@ -31,6 +31,8 @@ from types import SimpleNamespace
 
 import numpy as np
 
+from native_selfplay import expand_planes
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
@@ -63,11 +65,19 @@ def fake_logits_row() -> np.ndarray:
 
 
 def fake_values(inputs: np.ndarray) -> np.ndarray:
-    """Deterministic float32 values in [-0.2, 0.3] from the encoded planes."""
+    """Deterministic float32 values in [-0.2, 0.3] from the encoded planes.
+
+    Plane 102 is the halfmove clock — the ONE non-binary plane — so the
+    compact uint8 wire format must be expanded first, exactly as the real
+    network's input pipeline does.  Reading the raw uint8 here would feed this
+    stand-in a value 100x larger than the network sees and silently break
+    native-vs-python parity.
+    """
+    planes = expand_planes(inputs)
     return (
-        0.4 * inputs[:, 102, 0, 0]
+        0.4 * planes[:, 102, 0, 0]
         - 0.2
-        + 0.1 * (inputs[:, 103, 0, 0] > 0.5)
+        + 0.1 * (planes[:, 103, 0, 0] > 0.5)
     ).astype(np.float32)
 
 
@@ -92,8 +102,9 @@ class FakeEvaluator:
         legal_indices: np.ndarray,
     ) -> tuple[np.ndarray, np.ndarray]:
         logits = self.logits_row[legal_indices].copy()  # CSR order, float32
+        planes = expand_planes(inputs)
         for b in range(inputs.shape[0]):
-            side = "w" if inputs[b, 96, 0, 0] > 0.5 else "b"
+            side = "w" if planes[b, 96, 0, 0] > 0.5 else "b"
             idx = self.boost.get(side)
             if idx is None:
                 continue

@@ -450,6 +450,32 @@ void Position::encode_planes(float* out, int history_steps) const {
     }
 }
 
+void Position::encode_planes_u8(std::uint8_t* out, int history_steps) const {
+    if (history_steps < 1) throw std::invalid_argument("history_steps must be positive");
+
+    // Encode into the float form first, then narrow.  Sharing the one
+    // implementation is what guarantees the two encoders can never drift
+    // apart: every plane here is a straight 0/1 copy except the halfmove
+    // clock, which is re-read from the board rather than recovered from the
+    // float (recovering it would round-trip through the /100.0 divide).
+    const int num_planes = 12 * history_steps + 8;
+    std::vector<float> tmp(static_cast<std::size_t>(num_planes) * 64);
+    encode_planes(tmp.data(), history_steps);
+
+    for (std::size_t i = 0; i < tmp.size(); ++i)
+        out[i] = tmp[i] != 0.0f ? 1u : 0u;
+
+    const int meta = 12 * history_steps;
+    const std::size_t hm = static_cast<std::size_t>(meta + HALFMOVE_META_PLANE) * 64;
+    const std::uint32_t clock = board_.halfMoveClock();
+    const std::uint8_t stored = static_cast<std::uint8_t>(
+        clock > static_cast<std::uint32_t>(HALFMOVE_CLAMP)
+            ? HALFMOVE_CLAMP
+            : clock);
+    for (int sq = 0; sq < 64; ++sq)
+        out[hm + static_cast<std::size_t>(sq)] = stored;
+}
+
 std::uint64_t perft(std::string_view fen, int depth) {
     if (depth < 0) throw std::invalid_argument("perft depth must be non-negative");
     Position position = Position::from_fen(fen);

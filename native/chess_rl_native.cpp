@@ -70,6 +70,21 @@ py::array_t<float> encode_fen(const std::string& fen, int history_steps) {
     return encode_position(Position::from_fen(fen), history_steps);
 }
 
+// Compact uint8 form of encode_position; expand with
+// `expand_planes` / HALFMOVE_* to recover the float encoding exactly.
+py::array_t<std::uint8_t> encode_position_u8(const Position& position,
+                                             int history_steps) {
+    if (history_steps < 1) throw std::invalid_argument("history_steps must be positive");
+    const int num_planes = 12 * history_steps + 8;
+    py::array_t<std::uint8_t> result({num_planes, 8, 8});
+    position.encode_planes_u8(result.mutable_data(), history_steps);
+    return result;
+}
+
+py::array_t<std::uint8_t> encode_fen_u8(const std::string& fen, int history_steps) {
+    return encode_position_u8(Position::from_fen(fen), history_steps);
+}
+
 // Dense 4672-length 0/1 legal-move mask (parity/testing only; the hot path
 // uses Position::legal_move_indices() to avoid the dense allocation).
 py::array_t<float> legal_move_mask(const Position& position) {
@@ -88,7 +103,9 @@ py::array_t<float> legal_move_mask(const Position& position) {
 //
 //   tokens:          list[int] length B (opaque; passed back to
 //                    apply_evaluations unchanged; token i == leaf i)
-//   inputs:          float32 [B, 104, 8, 8] C-contiguous (encode_planes output)
+//   inputs:          uint8 [B, 104, 8, 8] C-contiguous
+//                    (encode_planes_u8 output: binary planes 0/1, halfmove
+//                    plane = raw clock, divide by HALFMOVE_SCALE to expand)
 //   legal_offsets:   int32 [B+1] CSR row pointers
 //   legal_indices:   int32 [K] flat, sorted ascending within each row
 py::tuple mcts_gather_leaves(MCTS& self, int max_batch) {
@@ -98,8 +115,8 @@ py::tuple mcts_gather_leaves(MCTS& self, int max_batch) {
     std::vector<int> tokens(static_cast<std::size_t>(B));
     for (int i = 0; i < B; ++i) tokens[static_cast<std::size_t>(i)] = i;
 
-    py::array_t<float> inputs({B, 104, 8, 8});
-    float* in_ptr = inputs.mutable_data();
+    py::array_t<std::uint8_t> inputs({B, 104, 8, 8});
+    std::uint8_t* in_ptr = inputs.mutable_data();
     for (int i = 0; i < B; ++i) {
         const auto& planes = result.leaves[static_cast<std::size_t>(i)].planes;
         std::copy(planes.begin(), planes.end(),
@@ -149,8 +166,8 @@ py::tuple actor_gather_leaves(Actor& self, int max_batch) {
     std::vector<int> tokens(static_cast<std::size_t>(B));
     for (int i = 0; i < B; ++i) tokens[static_cast<std::size_t>(i)] = i;
 
-    py::array_t<float> inputs({B, 104, 8, 8});
-    float* in_ptr = inputs.mutable_data();
+    py::array_t<std::uint8_t> inputs({B, 104, 8, 8});
+    std::uint8_t* in_ptr = inputs.mutable_data();
     for (int i = 0; i < B; ++i) {
         const auto& planes = result.leaves[static_cast<std::size_t>(i)].planes;
         std::copy(planes.begin(), planes.end(),
@@ -222,6 +239,12 @@ PYBIND11_MODULE(_chess_rl_native, module) {
 
     // Policy / action-map constants (AlphaZero 73-plane policy).
     module.attr("POLICY_PLANES") = POLICY_PLANES;
+    // Compact-plane contract (see Position::encode_planes_u8): the halfmove
+    // plane is the only non-binary plane; every consumer must divide exactly
+    // that plane by HALFMOVE_SCALE to recover the float encoding.
+    module.attr("HALFMOVE_META_PLANE") = Position::HALFMOVE_META_PLANE;
+    module.attr("HALFMOVE_SCALE") = Position::HALFMOVE_SCALE;
+    module.attr("HALFMOVE_CLAMP") = Position::HALFMOVE_CLAMP;
     module.attr("POLICY_SIZE") = POLICY_SIZE;
     module.attr("QUEEN_PLANES") = QUEEN_PLANES;
     module.attr("KNIGHT_PLANES") = KNIGHT_PLANES;
@@ -233,6 +256,11 @@ PYBIND11_MODULE(_chess_rl_native, module) {
     module.def("policy_to_vector", &policy_to_vector, py::arg("pi"));
     module.def("encode_fen", &encode_fen, py::arg("fen"),
                py::arg("history_steps") = 8);
+    module.def("encode_fen_u8", &encode_fen_u8, py::arg("fen"),
+               py::arg("history_steps") = 8,
+               "Compact uint8 encoding; divide plane "
+               "(12*history_steps + HALFMOVE_META_PLANE) by HALFMOVE_SCALE to "
+               "recover the float encoding exactly.");
 
     py::class_<Position>(module, "Position")
         .def_static("from_fen", &Position::from_fen, py::arg("fen"))
@@ -243,6 +271,7 @@ PYBIND11_MODULE(_chess_rl_native, module) {
         .def("history_uci", &Position::history_uci)
         .def("history_fens", &Position::history_fens, py::arg("max_steps") = 8)
         .def("is_repetition", &Position::is_repetition, py::arg("count"))
+        .def("encode_u8", &encode_position_u8, py::arg("history_steps") = 8)
         .def("outcome", [](const Position& position, bool claim_draw) {
             return outcome_to_python(position.outcome(claim_draw));
         }, py::arg("claim_draw") = true)

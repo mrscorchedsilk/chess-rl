@@ -130,6 +130,26 @@ class InferenceRuntime:
         self.num_planes = int(self.cfg.num_input_planes)
         self.board_size = int(self.cfg.board_size)
 
+        # ---- compact-plane contract (see Position::encode_planes_u8) ---- #
+        # Absolute index of the one non-binary plane, and the divisor that
+        # turns its stored raw clock back into the float encoding.  Read from
+        # the native module so the constant can never drift from the encoder;
+        # the fallback keeps this file importable without the extension.
+        history_steps = int(getattr(self.cfg, "history_steps", 8))
+        try:
+            import chess_rl_native as _native
+            meta_plane = int(_native.HALFMOVE_META_PLANE)
+            self.halfmove_scale = float(_native.HALFMOVE_SCALE)
+        except Exception:  # noqa: BLE001 - extension optional at import time
+            meta_plane, self.halfmove_scale = 6, 100.0
+        self.halfmove_plane = 12 * history_steps + meta_plane
+        if not 0 <= self.halfmove_plane < self.num_planes:
+            raise ValueError(
+                f"halfmove plane index {self.halfmove_plane} outside "
+                f"[0, {self.num_planes}); history_steps={history_steps} does "
+                "not match num_input_planes"
+            )
+
         # ---- model residency: FP32 master weights, eval, channels_last ---- #
         if model is None:
             model = ChessNet(self.cfg)
@@ -191,6 +211,10 @@ class InferenceRuntime:
                 "in": torch.empty(
                     in_shape, dtype=self.staging_dtype, pin_memory=True
                 ),
+                # Compact-plane staging: the native actor emits uint8 planes,
+                # which move 4x fewer bytes over PCIe and skip the CPU-side
+                # float cast entirely.  Expansion happens on the GPU.
+                "in_u8": torch.empty(in_shape, dtype=torch.uint8, pin_memory=True),
                 "off": torch.empty((b + 1,), dtype=torch.int32, pin_memory=True),
                 "idx": torch.empty((cap,), dtype=torch.int32, pin_memory=True),
                 "logits": torch.empty((cap,), dtype=torch.float32, pin_memory=True),
@@ -202,6 +226,9 @@ class InferenceRuntime:
                     dtype=self.staging_dtype,
                     device=self.device,
                     memory_format=torch.channels_last,
+                ),
+                "in_u8": torch.empty(
+                    in_shape, dtype=torch.uint8, device=self.device
                 ),
                 "off": torch.empty((b + 1,), dtype=torch.int32, device=self.device),
                 "idx": torch.empty((cap,), dtype=torch.int32, device=self.device),
@@ -246,10 +273,11 @@ class InferenceRuntime:
     ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, int, int]:
         if not isinstance(inputs, np.ndarray):
             inputs = np.asarray(inputs)
-        if inputs.dtype != np.float32:
+        if inputs.dtype not in (np.float32, np.uint8):
             raise ValueError(
-                f"inputs must be float32, got {inputs.dtype}; the native "
-                "gather_leaves contract is np.float32[B,104,8,8]"
+                f"inputs must be float32 or uint8, got {inputs.dtype}; the "
+                "native gather_leaves contract is np.uint8[B,104,8,8] "
+                "(compact planes) and np.float32[B,104,8,8] is still accepted"
             )
         if inputs.ndim != 4 or inputs.shape[1:] != (
             self.num_planes,
@@ -308,6 +336,28 @@ class InferenceRuntime:
             )
         return inputs, off, idx, B, K
 
+    def _expand_u8_into(self, dst: torch.Tensor, src_u8: torch.Tensor,
+                        B: int) -> None:
+        """Expand compact uint8 planes into the staging-dtype device buffer.
+
+        The compact encoding (Position::encode_planes_u8) is strictly binary
+        except for the halfmove-clock plane, which carries the RAW clock.  The
+        float encoder computes that plane as ``float(clock / 100.0)``; here the
+        divide is done on the GPU in FP32 before narrowing to the staging
+        dtype, which reproduces the float encoder bit-for-bit (verified for
+        every clock value 0..255 in tests/test_compact_planes.py).
+
+        Every other plane is 0/1 and converts exactly in any float dtype.
+        """
+        dst.copy_(src_u8)
+        hm = self.halfmove_plane
+        # One plane, B*64 elements: divide in FP32 then narrow, so an FP16
+        # staging dtype cannot round the quotient differently from the CPU
+        # float encoder.
+        dst[:B, hm] = (
+            src_u8[:B, hm].to(torch.float32) / self.halfmove_scale
+        ).to(dst.dtype)
+
     def prepare(
         self, inputs: np.ndarray, offsets: np.ndarray, indices: np.ndarray
     ) -> _Call:
@@ -321,10 +371,19 @@ class InferenceRuntime:
         pin, dev = self._pinned[bucket], self._dev[bucket]
 
         # ---- stage on pinned host (synchronous CPU copies) ---- #
-        staged_in = torch.from_numpy(np.ascontiguousarray(inputs))
-        if self.staging_dtype == torch.float16:
-            staged_in = staged_in.half()
-        pin["in"][:B].copy_(staged_in)
+        # Compact path: uint8 planes are memcpy'd as-is — no CPU float cast,
+        # and a quarter of the PCIe bytes.  Expansion to the staging dtype
+        # happens on the GPU in _expand_u8_into.
+        compact = inputs.dtype == np.uint8
+        if compact:
+            pin["in_u8"][:B].copy_(
+                torch.from_numpy(np.ascontiguousarray(inputs))
+            )
+        else:
+            staged_in = torch.from_numpy(np.ascontiguousarray(inputs))
+            if self.staging_dtype == torch.float16:
+                staged_in = staged_in.half()
+            pin["in"][:B].copy_(staged_in)
         pin["off"][: B + 1].copy_(torch.from_numpy(off))
         if K:
             pin["idx"][:K].copy_(torch.from_numpy(idx))
@@ -335,7 +394,11 @@ class InferenceRuntime:
         # ---- non-blocking H2D on the dedicated copy-in stream ---- #
         ev_h2d = self._events[bucket]["h2d"]
         with torch.cuda.stream(self.stream_h2d):
-            dev["in"].copy_(pin["in"], non_blocking=True)
+            if compact:
+                dev["in_u8"].copy_(pin["in_u8"], non_blocking=True)
+                self._expand_u8_into(dev["in"], dev["in_u8"], B)
+            else:
+                dev["in"].copy_(pin["in"], non_blocking=True)
             dev["off"].copy_(pin["off"], non_blocking=True)
             if K:
                 dev["idx"][:K].copy_(pin["idx"][:K], non_blocking=True)

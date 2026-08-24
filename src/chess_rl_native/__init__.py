@@ -29,6 +29,14 @@ policy_to_vector = _native.policy_to_vector
 # Encoder.
 encode_fen = _native.encode_fen
 
+# Compact uint8 encoder (4x smaller on the wire).  Every plane is binary
+# except the halfmove-clock plane, which stores the RAW clock; dividing that
+# one plane by HALFMOVE_SCALE recovers the float encoding bit-exactly.
+encode_fen_u8 = _native.encode_fen_u8
+HALFMOVE_META_PLANE = _native.HALFMOVE_META_PLANE
+HALFMOVE_SCALE = _native.HALFMOVE_SCALE
+HALFMOVE_CLAMP = _native.HALFMOVE_CLAMP
+
 
 def native_abi_version() -> str:
     return _native.native_abi_version()

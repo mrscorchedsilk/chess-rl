@@ -49,6 +49,23 @@ class Position {
     // Fills `out` with num_planes * 64 floats (plane-major, rank*8+file order).
     void encode_planes(float* out, int history_steps = 8) const;
 
+    // Compact uint8 form of the SAME encoding, 4x smaller on the wire.
+    //
+    // Every plane except the halfmove-clock plane is strictly binary, so it
+    // stores 0/1.  The halfmove plane (index HALFMOVE_PLANE, counted from
+    // 12*history_steps) stores the RAW clock, clamped to 255; the consumer
+    // recovers the float plane by dividing that plane by HALFMOVE_SCALE.
+    // That round-trip is bit-exact for every clock value 0..255 (see
+    // tests/test_compact_planes.py), and the 75-move rule ends a game long
+    // before the clamp can be reached in self-play.
+    void encode_planes_u8(std::uint8_t* out, int history_steps = 8) const;
+
+    // Index of the halfmove-clock plane WITHIN the 8 meta planes, and the
+    // divisor that turns the stored clock back into the float plane value.
+    static constexpr int HALFMOVE_META_PLANE = 6;
+    static constexpr float HALFMOVE_SCALE = 100.0f;
+    static constexpr int HALFMOVE_CLAMP = 255;
+
   private:
     Position() = default;
 

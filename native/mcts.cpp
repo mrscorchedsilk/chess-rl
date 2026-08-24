@@ -195,7 +195,7 @@ MCTS::GatherResult MCTS::gather_leaves(int max_batch) {
             pos_->push_uci(pos_->index_to_move(pool_.move_index(leaf.path[k])));
         }
         leaf.planes.resize(NUM_PLANES * SQUARES);
-        pos_->encode_planes(leaf.planes.data(), HISTORY_STEPS);
+        pos_->encode_planes_u8(leaf.planes.data(), HISTORY_STEPS);
         leaf.legal = pos_->legal_move_indices();
         for (std::size_t k = 1; k < leaf.path.size(); ++k) pos_->pop();
 

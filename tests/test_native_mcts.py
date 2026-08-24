@@ -96,7 +96,10 @@ def test_start_position_search_runs_to_completion_and_policy_is_sane():
     tokens, inputs, offsets, indices = mcts.gather_leaves(32)
     assert tokens == [0]
     assert inputs.shape == (1, PLANES, ROWS, COLS)
-    assert inputs.dtype == np.float32
+    # Compact-plane contract: gather_leaves emits uint8 planes (binary
+    # planes 0/1, halfmove plane = raw clock).  See
+    # tests/test_compact_planes.py for the exact-expansion proof.
+    assert inputs.dtype == np.uint8
     assert inputs.flags["C_CONTIGUOUS"]
     assert offsets.shape == (2,)
     assert offsets[0] == 0
@@ -213,7 +216,10 @@ def test_multileaf_gather_tensor_invariants():
         B = len(tokens)
         assert tokens == list(range(B))
         assert inputs.shape == (B, PLANES, ROWS, COLS)
-        assert inputs.dtype == np.float32
+        # Compact-plane contract: gather_leaves emits uint8 planes (binary
+        # planes 0/1, halfmove plane = raw clock).  See
+        # tests/test_compact_planes.py for the exact-expansion proof.
+        assert inputs.dtype == np.uint8
         assert inputs.flags["C_CONTIGUOUS"]
         assert offsets.dtype == np.int32
         assert indices.dtype == np.int32

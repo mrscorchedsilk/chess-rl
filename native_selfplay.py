@@ -38,6 +38,36 @@ _MIX1 = 0xBF58476D1CE4E5B9
 _MIX2 = 0x94D049BB133111EB
 
 
+# Compact-plane contract (see native/position.cpp::encode_planes_u8): the
+# native actor emits uint8 planes.  Every plane is binary except the
+# halfmove-clock plane, which carries the RAW clock and must be divided by
+# HALFMOVE_SCALE to recover the float encoding.
+#
+# The GPU runtime does this expansion on-device (InferenceRuntime._expand_u8_into);
+# this host-side version exists for CPU consumers — test doubles, the
+# CPU arena path, and anything else standing in for the network — so a
+# stand-in evaluator sees exactly the features the real network sees.
+HALFMOVE_PLANE = 12 * 8 + native.HALFMOVE_META_PLANE   # 102 for history_steps=8
+HALFMOVE_SCALE = float(native.HALFMOVE_SCALE)
+
+
+def expand_planes(planes: np.ndarray, halfmove_plane: int = HALFMOVE_PLANE
+                  ) -> np.ndarray:
+    """Expand compact uint8 planes to the float32 encoding, exactly.
+
+    float32 input is returned unchanged (already expanded), so callers can
+    accept either wire format without branching.  The divide is done in
+    float32, which reproduces the C++ ``float(clock / 100.0)`` bit-for-bit
+    for every storable clock value (tests/test_compact_planes.py).
+    """
+    arr = np.asarray(planes)
+    if arr.dtype != np.uint8:
+        return arr
+    out = arr.astype(np.float32)
+    out[..., halfmove_plane, :, :] /= np.float32(HALFMOVE_SCALE)
+    return out
+
+
 def derive_selfplay_seed(base_seed: int, iteration: int) -> int:
     """Stable unsigned 64-bit self-play round seed from ``(base_seed, iteration)``.
 

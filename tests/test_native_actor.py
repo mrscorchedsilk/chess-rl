@@ -163,7 +163,10 @@ def test_gather_leaves_merges_across_games():
     assert B > 1
     assert tokens == list(range(B))
     assert inputs.shape == (B, PLANES, ROWS, COLS)
-    assert inputs.dtype == np.float32
+    # Compact-plane contract: gather_leaves emits uint8 planes (binary
+    # planes 0/1, halfmove plane = raw clock).  See
+    # tests/test_compact_planes.py for the exact-expansion proof.
+    assert inputs.dtype == np.uint8
     assert inputs.flags["C_CONTIGUOUS"]
     assert offsets.dtype == np.int32
     assert indices.dtype == np.int32
