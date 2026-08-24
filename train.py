@@ -1991,7 +1991,12 @@ def run_native(cfg=None, resume=False, on_iteration=None,
             # consecutive iterations play genuinely new games while resuming at
             # the same iteration boundary reproduces the identical round.
             round_seed = native_selfplay.derive_selfplay_seed(cfg.seed, iteration)
-            sp = native_selfplay.NativeSelfPlay(
+            # ShardedSelfPlay with shards=1 is byte-identical to
+            # NativeSelfPlay (same seed used unchanged, same serial loop), so
+            # the sharded driver is used unconditionally and cfg.selfplay_shards
+            # selects the behaviour.  Using the serial class here would have
+            # left the CPU/GPU overlap unreachable from the training loop.
+            sp = native_selfplay.ShardedSelfPlay(
                 cfg,
                 inference_fn,
                 # games=None -> cfg.selfplay_games_in_flight, falling back to
@@ -2026,6 +2031,12 @@ def run_native(cfg=None, resume=False, on_iteration=None,
                         getattr(cfg, "selfplay_leaves_per_game", 0) or 0),
                     "max_batch": int(getattr(cfg, "selfplay_max_batch", 256)),
                     "actor_threads": int(getattr(sp.actor, "num_threads", 0)),
+                    "shards": int(getattr(sp, "shards", 1)),
+                    "gpu_busy_fraction": float(
+                        getattr(sp, "gpu_busy_fraction", 0.0)),
+                    **{f"term_{k}": v
+                       for k, v in getattr(sp, "termination_stats", {}).items()
+                       if k != "terminations"},
                     "examples": len(sp_examples),
                     "inference_calls": sp.inference_calls,
                     **sp.batch_stats,
@@ -2215,6 +2226,8 @@ def build_parser():
                         "3 epochs, 8192 gives 96 optimizer steps/iteration")
     p.add_argument("--replay-size", type=int, default=None,
                    help="replay capacity (preflighted against RAM and disk)")
+    p.add_argument("--max-game-length", type=int, default=None,
+                   help="ply cap; a game reaching it is scored a draw")
     p.add_argument("--optimizer", type=str, default=None,
                    choices=("adamw", "adam", "sgd"),
                    help="optimizer. NOTE: resuming an existing lineage "
@@ -2249,7 +2262,7 @@ def main(argv=None):
         args.arena_every, args.checkpoint_dir, args.architecture,
         args.games_in_flight, args.shards, args.train_epoch_size,
         args.replay_size, args.arena_games, args.arena_simulations,
-        args.optimizer, args.lr_schedule,
+        args.optimizer, args.lr_schedule, args.max_game_length,
     )
     cfg = None
     if (any(v is not None for v in overrides) or args.moves_left_head
@@ -2273,6 +2286,8 @@ def main(argv=None):
             cfg.train_epoch_size = args.train_epoch_size
         if args.replay_size is not None:
             cfg.replay_buffer_size = args.replay_size
+        if args.max_game_length is not None:
+            cfg.max_game_length = args.max_game_length
         if args.num_iterations is not None:
             cfg.num_iterations = args.num_iterations
         if args.arena_every is not None:

@@ -666,6 +666,31 @@ class ShardedSelfPlay:
         return self.gpu_busy_s / self.round_duration_s
 
     def _emit_round_telemetry(self, examples: int) -> None:
+        # Keep emitting the ORIGINAL gather_apply_advance record with its
+        # original field names.  The sharded driver is now the only self-play
+        # driver the trainer uses, so dropping this record would silently
+        # remove a phase that existing consumers (and the telemetry schema
+        # test) expect.  The per-shard timings are simply summed.
+        try:
+            telemetry.safe_emit(self.cfg, {
+                "type": "phase",
+                "phase": "gather_apply_advance",
+                "run_id": self.run_id,
+                "iteration": self.iteration,
+                "generation": self.generation,
+                "duration_s": self.round_duration_s,
+                "gather_calls": self.gather_calls,
+                "apply_calls": self.apply_calls,
+                "advance_calls": self.advance_calls,
+                "gather_s": self.gather_s,
+                "apply_s": self.apply_s,
+                "advance_s": self.advance_s,
+                "inference_calls": self.inference_calls,
+                "simulations": self.simulations,
+                **self.batch_stats,
+            })
+        except Exception:  # noqa: BLE001 - telemetry must never kill training
+            pass
         try:
             telemetry.safe_emit(self.cfg, {
                 "type": "phase",
@@ -693,6 +718,28 @@ class ShardedSelfPlay:
                    for k, v in self.termination_stats.items()
                    if k != "terminations"},
                 **self.batch_stats,
+            })
+        except Exception:  # noqa: BLE001 - telemetry must never kill training
+            pass
+        # Replay-diversity audit.  This is the record that caught the
+        # fixed-seed self-play collapse; the sharded driver must keep emitting
+        # it or the regression it guards against becomes invisible again.
+        try:
+            counts: dict = {}
+            for h in self.trajectory_hashes:
+                counts[h] = counts.get(h, 0) + 1
+            telemetry.safe_emit(self.cfg, {
+                "type": "diversity",
+                "source": "selfplay_round",
+                "run_id": self.run_id,
+                "iteration": self.iteration,
+                "generation": self.generation,
+                "replay_size": int(examples),
+                "unique_trajectory_hashes": len(counts),
+                "most_repeated_trajectory_count": (
+                    max(counts.values()) if counts else 0
+                ),
+                "trajectory_hashes": list(counts.keys())[:32],
             })
         except Exception:  # noqa: BLE001 - telemetry must never kill training
             pass

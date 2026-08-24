@@ -49,6 +49,28 @@ Two things follow, and they are the whole argument for v4:
 2. **The 11× larger network costs ~15% of throughput**, not 5×: 3188 vs 3770
    games/hour. The GPU had that much headroom.
 
+### Architecture comparison
+
+Same pipeline, 64 concurrent games, 2 shards, 60-ply cap, one process per body
+so the VRAM peaks are clean (`benchmarks/arch_compare.py`).
+
+| body | params | ms/step | train samples/s | peak VRAM | games/hour | GPU busy | nvidia-smi | power |
+|---|---|---|---|---|---|---|---|---|
+| v2-6x128 | 2.17 M | 15.78 | 15,839 | 0.24 GB | 3440 | 17.6% | 10.3% | 67 W |
+| v3-10x192 | 7.24 M | 31.51 | 7,933 | 0.49 GB | 3438 | 31.4% | 26.3% | 95 W |
+| v4-20x256 | 24.42 M | 75.13 | 3,327 | 1.25 GB | 3022 | 54.6% | 50.7% | 188 W |
+
+`v3-10x192` is **3.3x the parameters for no measurable throughput cost at all**
+(3438 vs 3440 games/hour) — the GPU simply had that much headroom.
+`v4-20x256` is 11.25x the parameters for 0.88x throughput.
+
+VRAM is nowhere near the limit: 1.25 GB of 11 GB at the training batch. The
+constraint on going larger is wall-clock per game, not memory.
+
+If you want the safest step rather than the largest, `v3-10x192` is free on
+this measurement and `v4-20x256` costs 12%. Which one is strongest per
+wall-clock hour is a training experiment; neither has been trained.
+
 ## 3. The launch command
 
 `v4-20x256` weights are incompatible with every earlier lineage by
@@ -88,7 +110,7 @@ What each non-obvious flag buys:
 | `--shards 4` | CPU/GPU overlap; worth 1.39× for this body, ~0 for v2. |
 | `--train-epoch-size 8192` | 96 optimizer steps per iteration instead of 9. The single largest lever on learning rate. |
 | `--replay-size 500000` | ~2.07 GB RAM and ~0.85 GB per checkpoint (measured). Preflighted at startup. |
-| `--arena-games 100` | the promotion gate is now a lower confidence bound; at 20 games it can only ever confirm a true score of ~0.75+. 100 games can confirm ~0.62. |
+| `--arena-games 100` | the promotion gate is now a lower confidence bound, so the game count sets the smallest improvement that can ever be confirmed. Measured, at threshold 0.55 / 95%: 20 games confirm a true score of 0.695+, 50 → 0.642, 100 → 0.615, 200 → 0.598, 400 → 0.584. |
 
 ## 4. What to watch
 

@@ -226,6 +226,14 @@ _PHASE_FIELDS = {
     "arena": {"arena_games", "arena_sims", "wins", "draws", "losses",
               "score", "accepted", "opening_seed", "opening_pairs",
               "opening_suite_hash"},
+    # ShardedSelfPlay emits its own round record in addition to the trainer's
+    # `selfplay` one: it is the driver that knows the shard split and the GPU
+    # occupancy, and it is also used standalone by the benchmarks.
+    "selfplay_sharded": {"shards", "shard_games", "games", "examples",
+                         "gather_s", "apply_s", "advance_s", "infer_s",
+                         "gpu_busy_s", "gpu_busy_fraction", "inference_calls",
+                         "gather_calls", "simulations", "leaves_per_game",
+                         "max_batch"},
     "checkpoint": {"snapshot", "bytes", "reason"},
 }
 
